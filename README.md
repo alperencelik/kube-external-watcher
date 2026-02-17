@@ -29,8 +29,8 @@ kube-external-watcher provides an `ExternalWatcher` that can be added to the con
 
 ## Getting Started
 
-For a detailed example implementation and integration pattern, please refer to the `docs/example-implementation.md` file.
+For a detailed example implementation and integration pattern, please refer to the [Example Implementation](docs/example-implementation.md).
 
 ## Architecture
 
-For architectural overview, please refer to the `docs/architecture.md` file.
+For architectural overview, please refer to the [Architecture](docs/architecture.md).
