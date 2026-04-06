@@ -28,6 +28,7 @@ type ExternalWatcher struct {
 	defaultPollInterval    time.Duration
 	eventChannelBufferSize int
 	logger                 logr.Logger
+	metrics                *metricsCollector
 
 	mu       sync.RWMutex
 	watchers map[types.NamespacedName]*resourceWatcher
@@ -105,6 +106,7 @@ func (w *ExternalWatcher) Start(ctx context.Context) error {
 		w.logger.V(1).Info("stopped resource watcher", "resource", key.String())
 	}
 	w.watchers = make(map[types.NamespacedName]*resourceWatcher)
+	w.metrics.resetRegisteredResources()
 
 	return nil
 }
@@ -137,9 +139,11 @@ func (w *ExternalWatcher) Register(key types.NamespacedName, config ResourceConf
 	}
 
 	rw := newResourceWatcher(key, config.ResourceKey, pollInterval, w.fetcher,
-		w.comparator, w.eventCh, w.logger.WithValues("resource", key.String()))
+		w.comparator, w.eventCh, w.logger.WithValues("resource", key.String()),
+		w.metrics)
 
 	w.watchers[key] = rw
+	w.metrics.incRegisteredResources()
 
 	if w.started {
 		rw.start(w.ctx)
@@ -157,6 +161,7 @@ func (w *ExternalWatcher) Unregister(key types.NamespacedName) {
 	if rw, ok := w.watchers[key]; ok {
 		rw.stop()
 		delete(w.watchers, key)
+		w.metrics.decRegisteredResources()
 		w.logger.V(1).Info("unregistered resource watcher", "resource", key.String())
 	}
 }

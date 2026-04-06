@@ -28,6 +28,8 @@ type resourceWatcher struct {
 	// running indicates whether the goroutine is active.
 	running bool
 
+	metrics *metricsCollector
+
 	// mu protects pollInterval for dynamic updates.
 	mu           sync.Mutex
 	pollInterval time.Duration
@@ -41,6 +43,7 @@ func newResourceWatcher(
 	comparator StateComparator,
 	eventCh chan<- event.GenericEvent,
 	logger logr.Logger,
+	metrics *metricsCollector,
 ) *resourceWatcher {
 	return &resourceWatcher{
 		key:          key,
@@ -50,6 +53,7 @@ func newResourceWatcher(
 		comparator:   comparator,
 		eventCh:      eventCh,
 		logger:       logger,
+		metrics:      metrics,
 	}
 }
 
@@ -96,32 +100,42 @@ func (rw *resourceWatcher) run(ctx context.Context) {
 }
 
 func (rw *resourceWatcher) poll(ctx context.Context) {
+	ns, name := rw.key.Namespace, rw.key.Name
+
 	desired, err := rw.fetcher.GetDesiredState(ctx, rw.key)
 	if err != nil {
 		rw.logger.Error(err, "failed to fetch desired state")
+		rw.metrics.incPollTotal(ns, name, "error")
 		return
 	}
 
+	fetchStart := time.Now()
 	rawExternal, err := rw.fetcher.FetchExternalResource(ctx, rw.resourceKey)
+	rw.metrics.observeFetchDuration(ns, name, time.Since(fetchStart))
 	if err != nil {
 		rw.logger.Error(err, "failed to fetch external resource state")
+		rw.metrics.incFetchExternalErrors(ns, name)
+		rw.metrics.incPollTotal(ns, name, "error")
 		return
 	}
 
 	actual, err := rw.fetcher.TransformExternalState(rawExternal)
 	if err != nil {
 		rw.logger.Error(err, "failed to transform external state")
+		rw.metrics.incPollTotal(ns, name, "error")
 		return
 	}
 
 	drifted, err := rw.comparator.HasDrifted(desired, actual)
 	if err != nil {
 		rw.logger.Error(err, "failed to compare states")
+		rw.metrics.incPollTotal(ns, name, "error")
 		return
 	}
 
 	if drifted {
 		rw.logger.V(1).Info("drift detected, triggering reconciliation")
+		rw.metrics.incDriftDetected(ns, name)
 
 		obj := &objectReference{
 			ObjectMeta: metav1.ObjectMeta{
@@ -137,4 +151,6 @@ func (rw *resourceWatcher) poll(ctx context.Context) {
 			return
 		}
 	}
+
+	rw.metrics.incPollTotal(ns, name, "success")
 }

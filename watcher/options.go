@@ -51,6 +51,15 @@ func WithEventChannelBufferSize(size int) Option {
 	}
 }
 
+// WithMetrics enables Prometheus metrics, registered against
+// controller-runtime's default metrics registry. When not set,
+// all metric operations are no-ops with zero overhead.
+func WithMetrics() Option {
+	return func(w *ExternalWatcher) {
+		w.metrics = newMetricsCollector()
+	}
+}
+
 // WithAutoRegister enables automatic resource registration via cache
 // informer events. When a CR of the given type is created or updated,
 // the fetcher's IsResourceReadyToWatch method is called first — if it
