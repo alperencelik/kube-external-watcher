@@ -18,12 +18,31 @@ import (
 // IsResourceReadyToWatch method — see ResourceStateFetcher.
 type ConfigExtractorFn func(obj client.Object) ResourceConfig
 
+// EventFilter provides optional predicates to filter informer events
+// before auto-register processes them. If a predicate returns false,
+// the event is skipped entirely (the handler logic does not run).
+// Nil functions are treated as "allow all" — only set the ones you
+// need to filter.
+type EventFilter struct {
+	// Add is called on informer Add events. Return false to skip.
+	Add func(obj client.Object) bool
+
+	// Update is called on informer Update events. Return false to skip.
+	// Both the old and new object are provided for comparison
+	// (e.g. generation change, annotation diff).
+	Update func(oldObj, newObj client.Object) bool
+
+	// Delete is called on informer Delete events. Return false to skip.
+	Delete func(obj client.Object) bool
+}
+
 // autoRegisterConfig holds the configuration for automatic resource
 // registration via cache informer events.
 type autoRegisterConfig struct {
 	cache     cache.Cache
 	obj       client.Object
 	extractor ConfigExtractorFn
+	filter    *EventFilter
 }
 
 // setupAutoRegister hooks into the cache informer for the configured
@@ -34,10 +53,15 @@ func setupAutoRegister(ctx context.Context, w *ExternalWatcher) error {
 		return fmt.Errorf("auto-register: failed to get informer: %w", err)
 	}
 
+	filter := w.autoRegister.filter
+
 	_, err = informer.AddEventHandler(toolscache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
 			cObj, ok := obj.(client.Object)
 			if !ok {
+				return
+			}
+			if filter != nil && filter.Add != nil && !filter.Add(cObj) {
 				return
 			}
 			key := types.NamespacedName{Name: cObj.GetName(), Namespace: cObj.GetNamespace()}
@@ -50,11 +74,15 @@ func setupAutoRegister(ctx context.Context, w *ExternalWatcher) error {
 			w.logger.V(1).Info("auto-registered resource", "resource", key.String())
 		},
 		UpdateFunc: func(oldObj, newObj interface{}) {
-			cObj, ok := newObj.(client.Object)
-			if !ok {
+			cOld, okOld := oldObj.(client.Object)
+			cNew, okNew := newObj.(client.Object)
+			if !okOld || !okNew {
 				return
 			}
-			key := types.NamespacedName{Name: cObj.GetName(), Namespace: cObj.GetNamespace()}
+			if filter != nil && filter.Update != nil && !filter.Update(cOld, cNew) {
+				return
+			}
+			key := types.NamespacedName{Name: cNew.GetName(), Namespace: cNew.GetNamespace()}
 			if !w.fetcher.IsResourceReadyToWatch(ctx, key) {
 				if w.IsRegistered(key) {
 					w.Unregister(key)
@@ -64,7 +92,7 @@ func setupAutoRegister(ctx context.Context, w *ExternalWatcher) error {
 				}
 				return
 			}
-			config := w.autoRegister.extractor(cObj)
+			config := w.autoRegister.extractor(cNew)
 			w.Register(key, config)
 			w.logger.V(2).Info("auto-register updated resource config", "resource", key.String())
 		},
@@ -74,6 +102,9 @@ func setupAutoRegister(ctx context.Context, w *ExternalWatcher) error {
 			}
 			cObj, ok := obj.(client.Object)
 			if !ok {
+				return
+			}
+			if filter != nil && filter.Delete != nil && !filter.Delete(cObj) {
 				return
 			}
 			key := types.NamespacedName{Name: cObj.GetName(), Namespace: cObj.GetNamespace()}

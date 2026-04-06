@@ -81,3 +81,16 @@ func WithAutoRegister(c cache.Cache, obj client.Object, fn ConfigExtractorFn) Op
 		}
 	}
 }
+
+// WithAutoRegisterFilter sets an EventFilter to control which informer
+// events are processed by auto-register. Events rejected by the filter
+// are silently skipped — the handler logic does not run for them.
+// Must be used together with WithAutoRegister; has no effect otherwise.
+func WithAutoRegisterFilter(f EventFilter) Option {
+	return func(w *ExternalWatcher) {
+		if w.autoRegister == nil {
+			return
+		}
+		w.autoRegister.filter = &f
+	}
+}

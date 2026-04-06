@@ -89,6 +89,39 @@ func setupTestWatcher(t *testing.T, extractor ConfigExtractorFn) (*ExternalWatch
 	return w, fi, w.eventCh, fetcher
 }
 
+// setupTestWatcherWithFilter is like setupTestWatcher but attaches an EventFilter.
+func setupTestWatcherWithFilter(t *testing.T, extractor ConfigExtractorFn, filter EventFilter) (*ExternalWatcher, *fakeInformer, chan event.GenericEvent, *testFetcher) {
+	t.Helper()
+	fi := &fakeInformer{}
+	fc := &fakeCache{informer: fi}
+
+	fetcher := &testFetcher{ready: true}
+	fetcher.setDesiredState("desired")
+	fetcher.setResourceState("different")
+
+	w := &ExternalWatcher{
+		fetcher:                fetcher,
+		comparator:             NewDeepEqualComparator(),
+		defaultPollInterval:    50 * time.Millisecond,
+		eventChannelBufferSize: 10,
+		logger:                 logr.Discard(),
+		watchers:               make(map[types.NamespacedName]*resourceWatcher),
+		autoRegister: &autoRegisterConfig{
+			cache:     fc,
+			obj:       &objectReference{},
+			extractor: extractor,
+			filter:    &filter,
+		},
+	}
+	w.eventCh = make(chan event.GenericEvent, w.eventChannelBufferSize)
+
+	if err := setupAutoRegister(context.Background(), w); err != nil {
+		t.Fatalf("setupAutoRegister failed: %v", err)
+	}
+
+	return w, fi, w.eventCh, fetcher
+}
+
 // startTestWatcher marks the watcher as started so Register spawns goroutines.
 func startTestWatcher(t *testing.T, w *ExternalWatcher) context.CancelFunc {
 	t.Helper()
@@ -343,5 +376,134 @@ func TestAutoRegister_UnregistersWhenNoLongerReady(t *testing.T) {
 
 	if w.IsRegistered(key) {
 		t.Fatal("expected resource to be unregistered after Update when no longer ready")
+	}
+}
+
+func TestAutoRegister_FilterBlocksAddEvent(t *testing.T) {
+	w, fi, _, _ := setupTestWatcherWithFilter(t,
+		func(obj client.Object) ResourceConfig {
+			return ResourceConfig{ResourceKey: "resource-" + obj.GetName()}
+		},
+		EventFilter{
+			Add: func(obj client.Object) bool {
+				return obj.GetName() != "blocked"
+			},
+		},
+	)
+
+	cancel := startTestWatcher(t, w)
+	defer cancel()
+
+	// "blocked" should be filtered out.
+	fi.handler.OnAdd(newTestObj("default", "blocked"), false)
+	if w.IsRegistered(types.NamespacedName{Namespace: "default", Name: "blocked"}) {
+		t.Fatal("expected filtered Add to be skipped")
+	}
+
+	// "allowed" should pass through.
+	fi.handler.OnAdd(newTestObj("default", "allowed"), false)
+	if !w.IsRegistered(types.NamespacedName{Namespace: "default", Name: "allowed"}) {
+		t.Fatal("expected non-filtered Add to register")
+	}
+}
+
+func TestAutoRegister_FilterBlocksUpdateEvent(t *testing.T) {
+	w, fi, _, _ := setupTestWatcherWithFilter(t,
+		func(obj client.Object) ResourceConfig {
+			return ResourceConfig{ResourceKey: "resource-" + obj.GetName()}
+		},
+		EventFilter{
+			Update: func(oldObj, newObj client.Object) bool {
+				// Only allow updates where generation changed.
+				return oldObj.GetGeneration() != newObj.GetGeneration()
+			},
+		},
+	)
+
+	cancel := startTestWatcher(t, w)
+	defer cancel()
+
+	// Add the resource first (no Update filter on Add).
+	obj := newTestObj("default", "gen-test")
+	fi.handler.OnAdd(obj, false)
+
+	key := types.NamespacedName{Namespace: "default", Name: "gen-test"}
+	if !w.IsRegistered(key) {
+		t.Fatal("expected resource to be registered after Add")
+	}
+
+	// Update with same generation — should be filtered.
+	callCount := 0
+	w.autoRegister.extractor = func(obj client.Object) ResourceConfig {
+		callCount++
+		return ResourceConfig{ResourceKey: "resource-" + obj.GetName()}
+	}
+
+	sameGen := newTestObj("default", "gen-test")
+	fi.handler.OnUpdate(obj, sameGen)
+	if callCount != 0 {
+		t.Errorf("expected extractor not called for same-generation update, got %d calls", callCount)
+	}
+
+	// Update with new generation — should pass.
+	newGen := &objectReference{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "gen-test",
+			Namespace:  "default",
+			Generation: 2,
+		},
+	}
+	fi.handler.OnUpdate(obj, newGen)
+	if callCount != 1 {
+		t.Errorf("expected extractor called once for generation-changed update, got %d", callCount)
+	}
+}
+
+func TestAutoRegister_FilterBlocksDeleteEvent(t *testing.T) {
+	w, fi, _, _ := setupTestWatcherWithFilter(t,
+		func(obj client.Object) ResourceConfig {
+			return ResourceConfig{ResourceKey: "resource-" + obj.GetName()}
+		},
+		EventFilter{
+			Delete: func(obj client.Object) bool {
+				return obj.GetName() != "keep-me"
+			},
+		},
+	)
+
+	cancel := startTestWatcher(t, w)
+	defer cancel()
+
+	// Register two resources.
+	fi.handler.OnAdd(newTestObj("default", "keep-me"), false)
+	fi.handler.OnAdd(newTestObj("default", "remove-me"), false)
+
+	keepKey := types.NamespacedName{Namespace: "default", Name: "keep-me"}
+	removeKey := types.NamespacedName{Namespace: "default", Name: "remove-me"}
+
+	// Delete both — only "remove-me" should actually unregister.
+	fi.handler.OnDelete(newTestObj("default", "keep-me"))
+	fi.handler.OnDelete(newTestObj("default", "remove-me"))
+
+	if !w.IsRegistered(keepKey) {
+		t.Fatal("expected 'keep-me' to remain registered (delete was filtered)")
+	}
+	if w.IsRegistered(removeKey) {
+		t.Fatal("expected 'remove-me' to be unregistered")
+	}
+}
+
+func TestAutoRegister_NilFilterAllowsAll(t *testing.T) {
+	// setupTestWatcher (without filter) should still work — all events pass.
+	w, fi, _, _ := setupTestWatcher(t, func(obj client.Object) ResourceConfig {
+		return ResourceConfig{ResourceKey: "resource-" + obj.GetName()}
+	})
+
+	cancel := startTestWatcher(t, w)
+	defer cancel()
+
+	fi.handler.OnAdd(newTestObj("default", "no-filter"), false)
+	if !w.IsRegistered(types.NamespacedName{Namespace: "default", Name: "no-filter"}) {
+		t.Fatal("expected resource registered when no filter is set")
 	}
 }
