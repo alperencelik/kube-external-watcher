@@ -80,7 +80,7 @@
       "type": "stat",
       "targets": [
         {
-          "expr": "kube_external_watcher_registered_resources{job=~\"$job\"}",
+          "expr": "kube_external_watcher_registered_resources{job=~\"$job\", controller=~\"$controller\"}",
           "legendFormat": "Resources",
           "refId": "A"
         }
@@ -113,7 +113,7 @@
       "type": "stat",
       "targets": [
         {
-          "expr": "sum(rate(kube_external_watcher_poll_total{job=~\"$job\"}[$__rate_interval]))",
+          "expr": "sum(rate(kube_external_watcher_poll_total{job=~\"$job\", controller=~\"$controller\"}[$__rate_interval]))",
           "legendFormat": "Polls/s",
           "refId": "A"
         }
@@ -149,7 +149,7 @@
       "type": "stat",
       "targets": [
         {
-          "expr": "sum(rate(kube_external_watcher_poll_total{job=~\"$job\", result=\"error\"}[$__rate_interval])) / sum(rate(kube_external_watcher_poll_total{job=~\"$job\"}[$__rate_interval]))",
+          "expr": "sum(rate(kube_external_watcher_poll_total{job=~\"$job\", result=\"error\"}[$__rate_interval])) / sum(rate(kube_external_watcher_poll_total{job=~\"$job\", controller=~\"$controller\"}[$__rate_interval]))",
           "legendFormat": "Error %",
           "refId": "A"
         }
@@ -182,7 +182,7 @@
       "type": "stat",
       "targets": [
         {
-          "expr": "sum(rate(kube_external_watcher_drift_detected_total{job=~\"$job\"}[$__rate_interval])) * 60",
+          "expr": "sum(rate(kube_external_watcher_drift_detected_total{job=~\"$job\", controller=~\"$controller\"}[$__rate_interval])) * 60",
           "legendFormat": "Drifts/min",
           "refId": "A"
         }
@@ -218,7 +218,7 @@
       "type": "stat",
       "targets": [
         {
-          "expr": "sum(rate(kube_external_watcher_fetch_external_duration_seconds_sum{job=~\"$job\"}[$__rate_interval])) / sum(rate(kube_external_watcher_fetch_external_duration_seconds_count{job=~\"$job\"}[$__rate_interval]))",
+          "expr": "sum(rate(kube_external_watcher_fetch_external_duration_seconds_sum{job=~\"$job\", controller=~\"$controller\"}[$__rate_interval])) / sum(rate(kube_external_watcher_fetch_external_duration_seconds_count{job=~\"$job\", controller=~\"$controller\"}[$__rate_interval]))",
           "legendFormat": "Avg",
           "refId": "A"
         }
@@ -252,7 +252,7 @@
       "type": "stat",
       "targets": [
         {
-          "expr": "sum(rate(kube_external_watcher_fetch_external_errors_total{job=~\"$job\"}[$__rate_interval])) * 60",
+          "expr": "sum(rate(kube_external_watcher_fetch_external_errors_total{job=~\"$job\", controller=~\"$controller\"}[$__rate_interval])) * 60",
           "legendFormat": "Errors/min",
           "refId": "A"
         }
@@ -300,7 +300,7 @@
       "type": "timeseries",
       "targets": [
         {
-          "expr": "sum by (result) (rate(kube_external_watcher_poll_total{job=~\"$job\"}[$__rate_interval]))",
+          "expr": "sum by (result) (rate(kube_external_watcher_poll_total{job=~\"$job\", controller=~\"$controller\"}[$__rate_interval]))",
           "legendFormat": "{{ result }}",
           "refId": "A"
         }
@@ -375,17 +375,17 @@
       "type": "timeseries",
       "targets": [
         {
-          "expr": "histogram_quantile(0.50, sum by (le) (rate(kube_external_watcher_fetch_external_duration_seconds_bucket{job=~\"$job\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(kube_external_watcher_fetch_external_duration_seconds_bucket{job=~\"$job\", controller=~\"$controller\"}[$__rate_interval])))",
           "legendFormat": "p50",
           "refId": "A"
         },
         {
-          "expr": "histogram_quantile(0.90, sum by (le) (rate(kube_external_watcher_fetch_external_duration_seconds_bucket{job=~\"$job\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.90, sum by (le) (rate(kube_external_watcher_fetch_external_duration_seconds_bucket{job=~\"$job\", controller=~\"$controller\"}[$__rate_interval])))",
           "legendFormat": "p90",
           "refId": "B"
         },
         {
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(kube_external_watcher_fetch_external_duration_seconds_bucket{job=~\"$job\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(kube_external_watcher_fetch_external_duration_seconds_bucket{job=~\"$job\", controller=~\"$controller\"}[$__rate_interval])))",
           "legendFormat": "p99",
           "refId": "C"
         }
@@ -609,28 +609,28 @@
       "type": "table",
       "targets": [
         {
-          "expr": "sum by (namespace, name) (rate(kube_external_watcher_poll_total{job=~\"$job\"}[$__rate_interval]))",
+          "expr": "sum by (namespace, name) (rate(kube_external_watcher_poll_total{job=~\"$job\", controller=~\"$controller\"}[$__rate_interval]))",
           "format": "table",
           "instant": true,
           "legendFormat": "",
           "refId": "Polls"
         },
         {
-          "expr": "sum by (namespace, name) (rate(kube_external_watcher_poll_total{job=~\"$job\", result=\"error\"}[$__rate_interval])) / sum by (namespace, name) (rate(kube_external_watcher_poll_total{job=~\"$job\"}[$__rate_interval]))",
+          "expr": "sum by (namespace, name) (rate(kube_external_watcher_poll_total{job=~\"$job\", result=\"error\"}[$__rate_interval])) / sum by (namespace, name) (rate(kube_external_watcher_poll_total{job=~\"$job\", controller=~\"$controller\"}[$__rate_interval]))",
           "format": "table",
           "instant": true,
           "legendFormat": "",
           "refId": "ErrorRate"
         },
         {
-          "expr": "histogram_quantile(0.90, sum by (le, namespace, name) (rate(kube_external_watcher_fetch_external_duration_seconds_bucket{job=~\"$job\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.90, sum by (le, namespace, name) (rate(kube_external_watcher_fetch_external_duration_seconds_bucket{job=~\"$job\", controller=~\"$controller\"}[$__rate_interval])))",
           "format": "table",
           "instant": true,
           "legendFormat": "",
           "refId": "FetchP90"
         },
         {
-          "expr": "sum by (namespace, name) (increase(kube_external_watcher_drift_detected_total{job=~\"$job\"}[$__rate_interval]))",
+          "expr": "sum by (namespace, name) (increase(kube_external_watcher_drift_detected_total{job=~\"$job\", controller=~\"$controller\"}[$__rate_interval]))",
           "format": "table",
           "instant": true,
           "legendFormat": "",
@@ -675,9 +675,21 @@
       {
         "current": { "selected": false, "text": "", "value": "" },
         "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-        "definition": "label_values(kube_external_watcher_poll_total{job=~\"$job\"}, namespace)",
+        "definition": "label_values(kube_external_watcher_poll_total{job=~\"$job\"}, controller)",
+        "name": "controller",
+        "query": { "query": "label_values(kube_external_watcher_poll_total{job=~\"$job\"}, controller)", "refId": "A" },
+        "regex": "",
+        "type": "query",
+        "includeAll": true,
+        "multi": true,
+        "allValue": ".*"
+      },
+      {
+        "current": { "selected": false, "text": "", "value": "" },
+        "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+        "definition": "label_values(kube_external_watcher_poll_total{job=~\"$job\", controller=~\"$controller\"}, namespace)",
         "name": "namespace",
-        "query": { "query": "label_values(kube_external_watcher_poll_total{job=~\"$job\"}, namespace)", "refId": "A" },
+        "query": { "query": "label_values(kube_external_watcher_poll_total{job=~\"$job\", controller=~\"$controller\"}, namespace)", "refId": "A" },
         "regex": "",
         "type": "query",
         "includeAll": true,

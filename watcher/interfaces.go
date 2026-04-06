@@ -45,6 +45,16 @@ type ResourceStateFetcher interface {
 	IsResourceReadyToWatch(ctx context.Context, key types.NamespacedName) bool
 }
 
+// ResourceStatusUpdater is an optional interface that ResourceStateFetcher
+// implementations can implement to receive a callback on every successful
+// poll cycle. This runs after FetchExternalResource succeeds, regardless
+// of whether drift was detected — useful for syncing external state
+// (e.g., uptime, IP addresses, power state) into the Kubernetes resource's
+// .status on every poll.
+type ResourceStatusUpdater interface {
+	UpdateResourceStatus(ctx context.Context, key types.NamespacedName, externalState any) error
+}
+
 // StateComparator determines whether the desired state and the
 // (transformed) external state differ. Both inputs are expected to be
 // in the same shape — the fetcher's TransformExternalState normalizes

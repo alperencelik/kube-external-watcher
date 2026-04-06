@@ -52,11 +52,13 @@ func WithEventChannelBufferSize(size int) Option {
 }
 
 // WithMetrics enables Prometheus metrics, registered against
-// controller-runtime's default metrics registry. When not set,
-// all metric operations are no-ops with zero overhead.
-func WithMetrics() Option {
+// controller-runtime's default metrics registry. The controller name
+// is used as a label to distinguish metrics from different controllers
+// when multiple ExternalWatcher instances share the same process.
+// When not set, all metric operations are no-ops with zero overhead.
+func WithMetrics(controllerName string) Option {
 	return func(w *ExternalWatcher) {
-		w.metrics = newMetricsCollector()
+		w.metrics = newMetricsCollector(controllerName)
 	}
 }
 

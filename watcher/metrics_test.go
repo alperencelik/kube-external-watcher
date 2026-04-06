@@ -16,7 +16,8 @@ import (
 func newTestMetrics(t *testing.T) (*metricsCollector, *prometheus.Registry) {
 	t.Helper()
 	reg := prometheus.NewRegistry()
-	m := newMetricsCollectorWithRegisterer(reg)
+	vecs := newMetricsVecs(reg)
+	m := newMetricsCollectorWithVecs("test-controller", vecs)
 	return m, reg
 }
 
@@ -39,7 +40,7 @@ func getCounterValue(t *testing.T, reg *prometheus.Registry, name string, labels
 	return 0
 }
 
-func getGaugeValue(t *testing.T, reg *prometheus.Registry, name string) float64 {
+func getGaugeValue(t *testing.T, reg *prometheus.Registry, name string, labels map[string]string) float64 {
 	t.Helper()
 	families, err := reg.Gather()
 	if err != nil {
@@ -47,11 +48,12 @@ func getGaugeValue(t *testing.T, reg *prometheus.Registry, name string) float64 
 	}
 	for _, f := range families {
 		if f.GetName() != name {
-			return 0
+			continue
 		}
-		metrics := f.GetMetric()
-		if len(metrics) > 0 {
-			return metrics[0].GetGauge().GetValue()
+		for _, m := range f.GetMetric() {
+			if matchLabels(m.GetLabel(), labels) {
+				return m.GetGauge().GetValue()
+			}
 		}
 	}
 	return 0
@@ -115,7 +117,7 @@ func TestMetrics_PollSuccessIncrementsCounter(t *testing.T) {
 	defer cancel()
 	rw.poll(ctx)
 
-	labels := map[string]string{"namespace": "default", "name": "test-poll", "result": "success"}
+	labels := map[string]string{"controller": "test-controller", "namespace": "default", "name": "test-poll", "result": "success"}
 	if v := getCounterValue(t, reg, "kube_external_watcher_poll_total", labels); v != 1 {
 		t.Errorf("expected poll_total{success}=1, got %v", v)
 	}
@@ -133,7 +135,7 @@ func TestMetrics_PollErrorIncrementsCounter(t *testing.T) {
 	defer cancel()
 	rw.poll(ctx)
 
-	labels := map[string]string{"namespace": "default", "name": "test-err", "result": "error"}
+	labels := map[string]string{"controller": "test-controller", "namespace": "default", "name": "test-err", "result": "error"}
 	if v := getCounterValue(t, reg, "kube_external_watcher_poll_total", labels); v != 1 {
 		t.Errorf("expected poll_total{error}=1, got %v", v)
 	}
@@ -152,12 +154,12 @@ func TestMetrics_FetchExternalErrorIncrementsCounter(t *testing.T) {
 	defer cancel()
 	rw.poll(ctx)
 
-	labels := map[string]string{"namespace": "default", "name": "test-fetch-err"}
+	labels := map[string]string{"controller": "test-controller", "namespace": "default", "name": "test-fetch-err"}
 	if v := getCounterValue(t, reg, "kube_external_watcher_fetch_external_errors_total", labels); v != 1 {
 		t.Errorf("expected fetch_external_errors=1, got %v", v)
 	}
 
-	pollLabels := map[string]string{"namespace": "default", "name": "test-fetch-err", "result": "error"}
+	pollLabels := map[string]string{"controller": "test-controller", "namespace": "default", "name": "test-fetch-err", "result": "error"}
 	if v := getCounterValue(t, reg, "kube_external_watcher_poll_total", pollLabels); v != 1 {
 		t.Errorf("expected poll_total{error}=1, got %v", v)
 	}
@@ -177,7 +179,7 @@ func TestMetrics_FetchDurationRecorded(t *testing.T) {
 	defer cancel()
 	rw.poll(ctx)
 
-	labels := map[string]string{"namespace": "default", "name": "test-duration"}
+	labels := map[string]string{"controller": "test-controller", "namespace": "default", "name": "test-duration"}
 	if c := getHistogramCount(t, reg, "kube_external_watcher_fetch_external_duration_seconds", labels); c != 1 {
 		t.Errorf("expected histogram sample count=1, got %v", c)
 	}
@@ -197,7 +199,7 @@ func TestMetrics_DriftDetectedIncrementsCounter(t *testing.T) {
 	defer cancel()
 	rw.poll(ctx)
 
-	labels := map[string]string{"namespace": "default", "name": "test-drift"}
+	labels := map[string]string{"controller": "test-controller", "namespace": "default", "name": "test-drift"}
 	if v := getCounterValue(t, reg, "kube_external_watcher_drift_detected_total", labels); v != 1 {
 		t.Errorf("expected drift_detected=1, got %v", v)
 	}
@@ -206,19 +208,21 @@ func TestMetrics_DriftDetectedIncrementsCounter(t *testing.T) {
 func TestMetrics_RegisteredResourcesGauge(t *testing.T) {
 	m, reg := newTestMetrics(t)
 
+	labels := map[string]string{"controller": "test-controller"}
+
 	m.incRegisteredResources()
 	m.incRegisteredResources()
-	if v := getGaugeValue(t, reg, "kube_external_watcher_registered_resources"); v != 2 {
+	if v := getGaugeValue(t, reg, "kube_external_watcher_registered_resources", labels); v != 2 {
 		t.Errorf("expected registered_resources=2, got %v", v)
 	}
 
 	m.decRegisteredResources()
-	if v := getGaugeValue(t, reg, "kube_external_watcher_registered_resources"); v != 1 {
+	if v := getGaugeValue(t, reg, "kube_external_watcher_registered_resources", labels); v != 1 {
 		t.Errorf("expected registered_resources=1, got %v", v)
 	}
 
 	m.resetRegisteredResources()
-	if v := getGaugeValue(t, reg, "kube_external_watcher_registered_resources"); v != 0 {
+	if v := getGaugeValue(t, reg, "kube_external_watcher_registered_resources", labels); v != 0 {
 		t.Errorf("expected registered_resources=0, got %v", v)
 	}
 }

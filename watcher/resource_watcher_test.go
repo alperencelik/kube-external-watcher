@@ -69,6 +69,21 @@ func (f *testFetcher) TransformExternalState(raw any) (any, error) {
 	return raw, nil
 }
 
+// testFetcherWithStatusUpdater embeds testFetcher and implements
+// ResourceStatusUpdater for testing the optional callback.
+type testFetcherWithStatusUpdater struct {
+	testFetcher
+	statusCalls atomic.Int64
+	statusErr   error
+	lastState   atomic.Value // stores the raw external state passed to UpdateResourceStatus
+}
+
+func (f *testFetcherWithStatusUpdater) UpdateResourceStatus(_ context.Context, _ types.NamespacedName, externalState any) error {
+	f.statusCalls.Add(1)
+	f.lastState.Store(externalState)
+	return f.statusErr
+}
+
 func TestResourceWatcher_DriftDetectedOnFirstPoll(t *testing.T) {
 	eventCh := make(chan event.GenericEvent, 10)
 	fetcher := &testFetcher{}
@@ -409,4 +424,106 @@ func TestResourceWatcher_TransformWithCmpOptions(t *testing.T) {
 	}
 
 	cancel()
+}
+
+func TestResourceWatcher_StatusUpdaterCalledOnEveryPoll(t *testing.T) {
+	eventCh := make(chan event.GenericEvent, 10)
+	fetcher := &testFetcherWithStatusUpdater{}
+	fetcher.setDesiredState("same")
+	fetcher.setResourceState("same") // no drift
+	key := types.NamespacedName{Namespace: "default", Name: "test-status"}
+
+	rw := newResourceWatcher(key, "rk", 50*time.Millisecond, fetcher, NewDeepEqualComparator(), eventCh, logr.Discard(), nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	rw.start(ctx)
+
+	time.Sleep(200 * time.Millisecond)
+	cancel()
+
+	// Status updater should have been called on every poll, even without drift.
+	if calls := fetcher.statusCalls.Load(); calls < 2 {
+		t.Errorf("expected multiple status update calls, got %d", calls)
+	}
+
+	// No drift events should have been sent.
+	select {
+	case evt := <-eventCh:
+		t.Errorf("unexpected drift event: %v", evt)
+	default:
+	}
+}
+
+func TestResourceWatcher_StatusUpdaterReceivesRawState(t *testing.T) {
+	eventCh := make(chan event.GenericEvent, 10)
+	fetcher := &testFetcherWithStatusUpdater{}
+	fetcher.setDesiredState("desired")
+	fetcher.setResourceState("raw-external-state")
+	// Transform changes the state, but UpdateResourceStatus should get the raw value.
+	fetcher.transformFn = func(raw any) (any, error) {
+		return "transformed", nil
+	}
+	key := types.NamespacedName{Namespace: "default", Name: "test-raw"}
+
+	rw := newResourceWatcher(key, "rk", 1*time.Hour, fetcher, NewDeepEqualComparator(), eventCh, logr.Discard(), nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	rw.poll(ctx)
+
+	if got := fetcher.lastState.Load(); got != "raw-external-state" {
+		t.Errorf("expected raw state passed to UpdateResourceStatus, got %v", got)
+	}
+}
+
+func TestResourceWatcher_StatusUpdaterErrorDoesNotBlockPoll(t *testing.T) {
+	eventCh := make(chan event.GenericEvent, 10)
+	fetcher := &testFetcherWithStatusUpdater{statusErr: errors.New("status update failed")}
+	fetcher.setDesiredState("desired")
+	fetcher.setResourceState("different") // drift exists
+	key := types.NamespacedName{Namespace: "default", Name: "test-status-err"}
+
+	rw := newResourceWatcher(key, "rk", 1*time.Hour, fetcher, NewDeepEqualComparator(), eventCh, logr.Discard(), nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	rw.poll(ctx)
+
+	// Status update errored, but drift detection should still proceed.
+	select {
+	case evt := <-eventCh:
+		if evt.Object.GetName() != "test-status-err" {
+			t.Errorf("expected event for test-status-err, got %s", evt.Object.GetName())
+		}
+	default:
+		t.Fatal("expected drift event despite status update error")
+	}
+
+	if fetcher.statusCalls.Load() != 1 {
+		t.Errorf("expected 1 status update call, got %d", fetcher.statusCalls.Load())
+	}
+}
+
+func TestResourceWatcher_WithoutStatusUpdaterStillWorks(t *testing.T) {
+	// testFetcher does NOT implement ResourceStatusUpdater — poll should work normally.
+	eventCh := make(chan event.GenericEvent, 10)
+	fetcher := &testFetcher{}
+	fetcher.setDesiredState("desired")
+	fetcher.setResourceState("different")
+	key := types.NamespacedName{Namespace: "default", Name: "test-no-updater"}
+
+	rw := newResourceWatcher(key, "rk", 1*time.Hour, fetcher, NewDeepEqualComparator(), eventCh, logr.Discard(), nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	rw.poll(ctx)
+
+	select {
+	case evt := <-eventCh:
+		if evt.Object.GetName() != "test-no-updater" {
+			t.Errorf("expected event for test-no-updater, got %s", evt.Object.GetName())
+		}
+	default:
+		t.Fatal("expected drift event without status updater")
+	}
 }

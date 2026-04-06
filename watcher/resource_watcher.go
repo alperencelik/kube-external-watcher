@@ -119,6 +119,12 @@ func (rw *resourceWatcher) poll(ctx context.Context) {
 		return
 	}
 
+	if updater, ok := rw.fetcher.(ResourceStatusUpdater); ok {
+		if err := updater.UpdateResourceStatus(ctx, rw.key, rawExternal); err != nil {
+			rw.logger.Error(err, "failed to update resource status")
+		}
+	}
+
 	actual, err := rw.fetcher.TransformExternalState(rawExternal)
 	if err != nil {
 		rw.logger.Error(err, "failed to transform external state")
