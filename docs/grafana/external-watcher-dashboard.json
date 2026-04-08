@@ -80,8 +80,8 @@
       "type": "stat",
       "targets": [
         {
-          "expr": "kube_external_watcher_registered_resources{job=~\"$job\", controller=~\"$controller\"}",
-          "legendFormat": "Resources",
+          "expr": "sum by (controller) (kube_external_watcher_registered_resources{job=~\"$job\", controller=~\"$controller\"})",
+          "legendFormat": "{{ controller }}",
           "refId": "A"
         }
       ]

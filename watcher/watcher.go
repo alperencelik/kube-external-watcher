@@ -98,6 +98,11 @@ func (w *ExternalWatcher) Start(ctx context.Context) error {
 	// Block until context is cancelled (manager shutdown).
 	<-ctx.Done()
 
+	// Cancel pending readiness retries.
+	if w.autoRegister != nil {
+		w.cancelAllReadinessRetries()
+	}
+
 	// Graceful shutdown: stop all resource watchers.
 	w.mu.Lock()
 	defer w.mu.Unlock()

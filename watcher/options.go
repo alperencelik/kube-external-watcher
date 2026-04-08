@@ -1,9 +1,11 @@
 package watcher
 
 import (
+	"context"
 	"time"
 
 	"github.com/go-logr/logr"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
@@ -65,19 +67,29 @@ func WithMetrics(controllerName string) Option {
 // WithAutoRegister enables automatic resource registration via cache
 // informer events. When a CR of the given type is created or updated,
 // the fetcher's IsResourceReadyToWatch method is called first — if it
-// returns false, the resource is skipped (or unregistered if it was
-// previously registered). If ready, the extractor function produces a
+// returns false, a per-resource retry goroutine with exponential backoff
+// re-checks readiness until the resource is ready, deleted, or the
+// watcher shuts down. If ready, the extractor function produces a
 // ResourceConfig and the resource is registered. When the CR is deleted,
 // the resource is unregistered.
 //
 // The cache is typically obtained via mgr.GetCache(). The obj parameter
 // is a prototype of the CR type to watch (e.g. &myv1.Database{}).
-func WithAutoRegister(c cache.Cache, obj client.Object, fn ConfigExtractorFn) Option {
+// An optional ReadinessRetryConfig can be passed to control readiness
+// retry behavior. If omitted, defaults apply (10s initial, 10m max,
+// unlimited retries).
+func WithAutoRegister(c cache.Cache, obj client.Object, fn ConfigExtractorFn, retryCfg ...ReadinessRetryConfig) Option {
 	return func(w *ExternalWatcher) {
+		var cfg ReadinessRetryConfig
+		if len(retryCfg) > 0 {
+			cfg = retryCfg[0]
+		}
 		w.autoRegister = &autoRegisterConfig{
-			cache:     c,
-			obj:       obj,
-			extractor: fn,
+			cache:       c,
+			obj:         obj,
+			extractor:   fn,
+			retryConfig: cfg.withDefaults(),
+			retries:     make(map[types.NamespacedName]context.CancelFunc),
 		}
 	}
 }
