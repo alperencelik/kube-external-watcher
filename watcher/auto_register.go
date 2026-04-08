@@ -3,6 +3,8 @@ package watcher
 import (
 	"context"
 	"fmt"
+	"sync"
+	"time"
 
 	"k8s.io/apimachinery/pkg/types"
 	toolscache "k8s.io/client-go/tools/cache"
@@ -36,6 +38,32 @@ type EventFilter struct {
 	Delete func(obj client.Object) bool
 }
 
+// ReadinessRetryConfig holds parameters for the readiness retry loop
+// that re-checks IsResourceReadyToWatch with exponential backoff when
+// a resource is not ready during auto-registration. Zero values use
+// defaults (InitialInterval: 10s, MaxInterval: 10m, MaxRetries: 0/unlimited).
+type ReadinessRetryConfig struct {
+	// InitialInterval is the delay before the first retry. Default: 10s.
+	InitialInterval time.Duration
+
+	// MaxInterval is the backoff cap. Default: 10m.
+	MaxInterval time.Duration
+
+	// MaxRetries is the maximum number of retry attempts. 0 = unlimited
+	// (stopped by context cancellation or resource deletion). Default: 0.
+	MaxRetries int
+}
+
+func (c ReadinessRetryConfig) withDefaults() ReadinessRetryConfig {
+	if c.InitialInterval <= 0 {
+		c.InitialInterval = 10 * time.Second
+	}
+	if c.MaxInterval <= 0 {
+		c.MaxInterval = 10 * time.Minute
+	}
+	return c
+}
+
 // autoRegisterConfig holds the configuration for automatic resource
 // registration via cache informer events.
 type autoRegisterConfig struct {
@@ -43,6 +71,12 @@ type autoRegisterConfig struct {
 	obj       client.Object
 	extractor ConfigExtractorFn
 	filter    *EventFilter
+
+	retryConfig ReadinessRetryConfig
+
+	// mutex for the retries map.
+	mu      sync.Mutex
+	retries map[types.NamespacedName]context.CancelFunc
 }
 
 // setupAutoRegister hooks into the cache informer for the configured
@@ -66,9 +100,11 @@ func setupAutoRegister(ctx context.Context, w *ExternalWatcher) error {
 			}
 			key := types.NamespacedName{Name: cObj.GetName(), Namespace: cObj.GetNamespace()}
 			if !w.fetcher.IsResourceReadyToWatch(ctx, key) {
-				w.logger.V(2).Info("auto-register: resource not ready, skipping", "resource", key.String())
+				w.logger.V(2).Info("auto-register: resource not ready, starting retry", "resource", key.String())
+				w.startReadinessRetry(ctx, key, cObj)
 				return
 			}
+			w.cancelReadinessRetry(key)
 			config := w.autoRegister.extractor(cObj)
 			w.Register(key, config)
 			w.logger.V(1).Info("auto-registered resource", "resource", key.String())
@@ -88,10 +124,12 @@ func setupAutoRegister(ctx context.Context, w *ExternalWatcher) error {
 					w.Unregister(key)
 					w.logger.V(1).Info("auto-unregistered resource (no longer ready)", "resource", key.String())
 				} else {
-					w.logger.V(2).Info("auto-register: resource not ready, skipping", "resource", key.String())
+					w.logger.V(2).Info("auto-register: resource not ready on update, starting retry", "resource", key.String())
+					w.startReadinessRetry(ctx, key, cNew)
 				}
 				return
 			}
+			w.cancelReadinessRetry(key)
 			config := w.autoRegister.extractor(cNew)
 			w.Register(key, config)
 			w.logger.V(2).Info("auto-register updated resource config", "resource", key.String())
@@ -108,6 +146,7 @@ func setupAutoRegister(ctx context.Context, w *ExternalWatcher) error {
 				return
 			}
 			key := types.NamespacedName{Name: cObj.GetName(), Namespace: cObj.GetNamespace()}
+			w.cancelReadinessRetry(key)
 			w.Unregister(key)
 			w.logger.V(1).Info("auto-unregistered resource", "resource", key.String())
 		},
@@ -118,4 +157,91 @@ func setupAutoRegister(ctx context.Context, w *ExternalWatcher) error {
 
 	w.logger.Info("auto-register enabled for informer")
 	return nil
+}
+
+// startReadinessRetry starts a per-resource goroutine that periodically
+// re-checks IsResourceReadyToWatch with exponential backoff. Once ready,
+// it extracts config and calls Register.
+func (w *ExternalWatcher) startReadinessRetry(ctx context.Context, key types.NamespacedName, obj client.Object) {
+	ar := w.autoRegister
+	ar.mu.Lock()
+	if _, exists := ar.retries[key]; exists {
+		ar.mu.Unlock()
+		return
+	}
+	retryCtx, cancel := context.WithCancel(ctx)
+	ar.retries[key] = cancel
+	ar.mu.Unlock()
+
+	// Deep-copy the object so the goroutine doesn't read a stale or
+	// mutated informer-managed pointer when it eventually succeeds.
+	objCopy := obj.DeepCopyObject().(client.Object)
+
+	cfg := ar.retryConfig
+	w.logger.V(1).Info("auto-register: starting readiness retry", "resource", key.String())
+
+	go func() {
+		defer func() {
+			ar.mu.Lock()
+			delete(ar.retries, key)
+			ar.mu.Unlock()
+		}()
+
+		interval := cfg.InitialInterval
+		attempts := 0
+		for {
+			select {
+			case <-retryCtx.Done():
+				w.logger.V(2).Info("auto-register: readiness retry cancelled", "resource", key.String())
+				return
+			case <-time.After(interval):
+			}
+
+			attempts++
+			if w.fetcher.IsResourceReadyToWatch(retryCtx, key) {
+				config := ar.extractor(objCopy)
+				w.Register(key, config)
+				w.logger.V(1).Info("auto-register: resource became ready after retry",
+					"resource", key.String(), "attempts", attempts)
+				return
+			}
+
+			w.logger.V(2).Info("auto-register: resource still not ready",
+				"resource", key.String(), "attempt", attempts, "nextInterval", interval)
+
+			if cfg.MaxRetries > 0 && attempts >= cfg.MaxRetries {
+				w.logger.V(1).Info("auto-register: max retries reached, giving up",
+					"resource", key.String(), "maxRetries", cfg.MaxRetries)
+				return
+			}
+
+			// Exponential backoff for retry
+			interval *= 2
+			if interval > cfg.MaxInterval {
+				interval = cfg.MaxInterval
+			}
+		}
+	}()
+}
+
+// cancelReadinessRetry cancels the retry goroutine for the given key
+func (w *ExternalWatcher) cancelReadinessRetry(key types.NamespacedName) {
+	ar := w.autoRegister
+	ar.mu.Lock()
+	defer ar.mu.Unlock()
+	if cancel, ok := ar.retries[key]; ok {
+		cancel()
+		delete(ar.retries, key)
+	}
+}
+
+// cancelAllReadinessRetries cancels all pending retry goroutines
+func (w *ExternalWatcher) cancelAllReadinessRetries() {
+	ar := w.autoRegister
+	ar.mu.Lock()
+	defer ar.mu.Unlock()
+	for _, cancel := range ar.retries {
+		cancel()
+	}
+	ar.retries = make(map[types.NamespacedName]context.CancelFunc)
 }

@@ -78,6 +78,12 @@ func setupTestWatcher(t *testing.T, extractor ConfigExtractorFn) (*ExternalWatch
 			cache:     fc,
 			obj:       &objectReference{},
 			extractor: extractor,
+			retryConfig: ReadinessRetryConfig{
+				InitialInterval: 5 * time.Millisecond,
+				MaxInterval:     20 * time.Millisecond,
+				MaxRetries:      0,
+			},
+			retries: make(map[types.NamespacedName]context.CancelFunc),
 		},
 	}
 	w.eventCh = make(chan event.GenericEvent, w.eventChannelBufferSize)
@@ -111,6 +117,12 @@ func setupTestWatcherWithFilter(t *testing.T, extractor ConfigExtractorFn, filte
 			obj:       &objectReference{},
 			extractor: extractor,
 			filter:    &filter,
+			retryConfig: ReadinessRetryConfig{
+				InitialInterval: 5 * time.Millisecond,
+				MaxInterval:     20 * time.Millisecond,
+				MaxRetries:      0,
+			},
+			retries: make(map[types.NamespacedName]context.CancelFunc),
 		},
 	}
 	w.eventCh = make(chan event.GenericEvent, w.eventChannelBufferSize)
@@ -120,6 +132,34 @@ func setupTestWatcherWithFilter(t *testing.T, extractor ConfigExtractorFn, filte
 	}
 
 	return w, fi, w.eventCh, fetcher
+}
+
+// isRetryPending returns whether a readiness retry goroutine is active for the given key.
+func isRetryPending(w *ExternalWatcher, key types.NamespacedName) bool {
+	ar := w.autoRegister
+	if ar == nil {
+		return false
+	}
+	ar.mu.Lock()
+	defer ar.mu.Unlock()
+	_, ok := ar.retries[key]
+	return ok
+}
+
+// waitForRetryDone polls until isRetryPending returns false or the timeout expires.
+func waitForRetryDone(t *testing.T, w *ExternalWatcher, key types.NamespacedName) {
+	t.Helper()
+	deadline := time.After(2 * time.Second)
+	for {
+		if !isRetryPending(w, key) {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatal("timed out waiting for retry goroutine to exit")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
 }
 
 // startTestWatcher marks the watcher as started so Register spawns goroutines.
@@ -505,5 +545,258 @@ func TestAutoRegister_NilFilterAllowsAll(t *testing.T) {
 	fi.handler.OnAdd(newTestObj("default", "no-filter"), false)
 	if !w.IsRegistered(types.NamespacedName{Namespace: "default", Name: "no-filter"}) {
 		t.Fatal("expected resource registered when no filter is set")
+	}
+}
+
+// Readiness retries
+
+func TestAutoRegister_RetryRegistersWhenReady(t *testing.T) {
+	w, fi, eventCh, fetcher := setupTestWatcher(t, func(obj client.Object) ResourceConfig {
+		return ResourceConfig{ResourceKey: "resource-" + obj.GetName()}
+	})
+
+	fetcher.mu.Lock()
+	fetcher.ready = false
+	fetcher.mu.Unlock()
+
+	cancel := startTestWatcher(t, w)
+	defer cancel()
+
+	obj := newTestObj("default", "slow-provision")
+	key := types.NamespacedName{Namespace: "default", Name: "slow-provision"}
+
+	// Add while not ready — should start retry.
+	fi.handler.OnAdd(obj, false)
+	if w.IsRegistered(key) {
+		t.Fatal("expected resource not registered immediately when not ready")
+	}
+	if !isRetryPending(w,key) {
+		t.Fatal("expected retry to be pending after Add when not ready")
+	}
+
+	// Mark ready — retry goroutine should register it.
+	fetcher.mu.Lock()
+	fetcher.ready = true
+	fetcher.mu.Unlock()
+
+	select {
+	case evt := <-eventCh:
+		if evt.Object.GetName() != "slow-provision" {
+			t.Errorf("expected event for slow-provision, got %s", evt.Object.GetName())
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for drift event after retry registration")
+	}
+
+	if !w.IsRegistered(key) {
+		t.Fatal("expected resource to be registered after retry succeeded")
+	}
+}
+
+func TestAutoRegister_RetryNoDuplicateForSameKey(t *testing.T) {
+	w, fi, _, fetcher := setupTestWatcher(t, func(obj client.Object) ResourceConfig {
+		return ResourceConfig{ResourceKey: "resource-" + obj.GetName()}
+	})
+
+	fetcher.mu.Lock()
+	fetcher.ready = false
+	fetcher.mu.Unlock()
+
+	cancel := startTestWatcher(t, w)
+	defer cancel()
+
+	obj := newTestObj("default", "dup-retry")
+	key := types.NamespacedName{Namespace: "default", Name: "dup-retry"}
+
+	// Fire two Add events for the same key.
+	fi.handler.OnAdd(obj, false)
+	fi.handler.OnAdd(obj, false)
+
+	if !isRetryPending(w,key) {
+		t.Fatal("expected retry to be pending")
+	}
+
+	// Verify there's exactly one entry in the retries map.
+	w.autoRegister.mu.Lock()
+	count := len(w.autoRegister.retries)
+	w.autoRegister.mu.Unlock()
+	if count != 1 {
+		t.Errorf("expected 1 retry entry, got %d", count)
+	}
+}
+
+func TestAutoRegister_RetryCancelledOnDelete(t *testing.T) {
+	w, fi, _, fetcher := setupTestWatcher(t, func(obj client.Object) ResourceConfig {
+		return ResourceConfig{ResourceKey: "resource-" + obj.GetName()}
+	})
+
+	fetcher.mu.Lock()
+	fetcher.ready = false
+	fetcher.mu.Unlock()
+
+	cancel := startTestWatcher(t, w)
+	defer cancel()
+
+	obj := newTestObj("default", "delete-during-retry")
+	key := types.NamespacedName{Namespace: "default", Name: "delete-during-retry"}
+
+	fi.handler.OnAdd(obj, false)
+	if !isRetryPending(w,key) {
+		t.Fatal("expected retry to be pending after Add")
+	}
+
+	// Delete should cancel the retry.
+	fi.handler.OnDelete(obj)
+
+	waitForRetryDone(t, w, key)
+	if w.IsRegistered(key) {
+		t.Fatal("expected resource not to be registered after Delete")
+	}
+}
+
+func TestAutoRegister_RetryCancelledWhenUpdateMakesReady(t *testing.T) {
+	w, fi, _, fetcher := setupTestWatcher(t, func(obj client.Object) ResourceConfig {
+		return ResourceConfig{ResourceKey: "resource-" + obj.GetName()}
+	})
+
+	fetcher.mu.Lock()
+	fetcher.ready = false
+	fetcher.mu.Unlock()
+
+	cancel := startTestWatcher(t, w)
+	defer cancel()
+
+	obj := newTestObj("default", "update-ready")
+	key := types.NamespacedName{Namespace: "default", Name: "update-ready"}
+
+	// Add while not ready — starts retry.
+	fi.handler.OnAdd(obj, false)
+	if !isRetryPending(w,key) {
+		t.Fatal("expected retry pending after Add")
+	}
+
+	// Mark ready and send Update — should register via Update handler and cancel retry.
+	fetcher.mu.Lock()
+	fetcher.ready = true
+	fetcher.mu.Unlock()
+	fi.handler.OnUpdate(obj, obj)
+
+	if !w.IsRegistered(key) {
+		t.Fatal("expected resource to be registered after Update when ready")
+	}
+
+	waitForRetryDone(t, w, key)
+}
+
+func TestAutoRegister_RetryCancelledOnShutdown(t *testing.T) {
+	// Build the watcher manually with a cancellable context passed to
+	// setupAutoRegister, so that cancelling it simulates manager shutdown.
+	fi := &fakeInformer{}
+	fc := &fakeCache{informer: fi}
+
+	fetcher := &testFetcher{ready: false}
+	fetcher.setDesiredState("desired")
+	fetcher.setResourceState("different")
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	w := &ExternalWatcher{
+		fetcher:                fetcher,
+		comparator:             NewDeepEqualComparator(),
+		defaultPollInterval:    50 * time.Millisecond,
+		eventChannelBufferSize: 10,
+		logger:                 logr.Discard(),
+		watchers:               make(map[types.NamespacedName]*resourceWatcher),
+		autoRegister: &autoRegisterConfig{
+			cache: fc,
+			obj:   &objectReference{},
+			extractor: func(obj client.Object) ResourceConfig {
+				return ResourceConfig{ResourceKey: "resource-" + obj.GetName()}
+			},
+			retryConfig: ReadinessRetryConfig{
+				InitialInterval: 5 * time.Millisecond,
+				MaxInterval:     20 * time.Millisecond,
+				MaxRetries:      0,
+			},
+			retries: make(map[types.NamespacedName]context.CancelFunc),
+		},
+	}
+	w.eventCh = make(chan event.GenericEvent, w.eventChannelBufferSize)
+
+	if err := setupAutoRegister(ctx, w); err != nil {
+		t.Fatalf("setupAutoRegister failed: %v", err)
+	}
+
+	w.mu.Lock()
+	w.ctx = ctx
+	w.started = true
+	w.mu.Unlock()
+
+	obj := newTestObj("default", "shutdown-retry")
+	key := types.NamespacedName{Namespace: "default", Name: "shutdown-retry"}
+
+	fi.handler.OnAdd(obj, false)
+	if !isRetryPending(w,key) {
+		t.Fatal("expected retry pending after Add")
+	}
+
+	// Cancel the context (simulates shutdown).
+	cancel()
+
+	waitForRetryDone(t, w, key)
+}
+
+func TestAutoRegister_RetryMaxRetriesGivesUp(t *testing.T) {
+	w, fi, _, fetcher := setupTestWatcher(t, func(obj client.Object) ResourceConfig {
+		return ResourceConfig{ResourceKey: "resource-" + obj.GetName()}
+	})
+
+	fetcher.mu.Lock()
+	fetcher.ready = false
+	fetcher.mu.Unlock()
+
+	// Set maxRetries to 3.
+	w.autoRegister.retryConfig.MaxRetries = 3
+
+	cancel := startTestWatcher(t, w)
+	defer cancel()
+
+	obj := newTestObj("default", "max-retry")
+	key := types.NamespacedName{Namespace: "default", Name: "max-retry"}
+
+	fi.handler.OnAdd(obj, false)
+	if !isRetryPending(w,key) {
+		t.Fatal("expected retry pending after Add")
+	}
+
+	waitForRetryDone(t, w, key)
+	if w.IsRegistered(key) {
+		t.Fatal("expected resource not to be registered after max retries exhausted")
+	}
+}
+
+func TestAutoRegister_RetryOnUpdateNotRegistered(t *testing.T) {
+	w, fi, _, fetcher := setupTestWatcher(t, func(obj client.Object) ResourceConfig {
+		return ResourceConfig{ResourceKey: "resource-" + obj.GetName()}
+	})
+
+	fetcher.mu.Lock()
+	fetcher.ready = false
+	fetcher.mu.Unlock()
+
+	cancel := startTestWatcher(t, w)
+	defer cancel()
+
+	obj := newTestObj("default", "update-not-registered")
+	key := types.NamespacedName{Namespace: "default", Name: "update-not-registered"}
+
+	// Send an Update event for a resource that was never registered.
+	fi.handler.OnUpdate(obj, obj)
+
+	if w.IsRegistered(key) {
+		t.Fatal("expected resource not registered when not ready")
+	}
+	if !isRetryPending(w,key) {
+		t.Fatal("expected retry to start on Update when not ready and not registered")
 	}
 }
