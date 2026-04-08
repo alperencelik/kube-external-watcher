@@ -126,7 +126,23 @@ func (w *ExternalWatcher) NeedLeaderElection() bool {
 // Register starts watching the external state for the given resource.
 // If the resource is already registered, its configuration is updated
 // without restarting the watcher goroutine. Goroutine-safe.
+//
+// When WithAutoRegister is enabled, this method is a no-op — auto-register
+// manages the full lifecycle via informer events. Use one approach per
+// watcher instance, not both.
 func (w *ExternalWatcher) Register(key types.NamespacedName, config ResourceConfig) {
+	if w.autoRegister != nil {
+		w.logger.Info(
+			"Register called while WithAutoRegister is enabled; "+
+				"call ignored — use either auto-register or manual Register/Unregister, not both",
+			"resource", key.String(),
+		)
+		return
+	}
+	w.doRegister(key, config)
+}
+
+func (w *ExternalWatcher) doRegister(key types.NamespacedName, config ResourceConfig) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
@@ -159,7 +175,22 @@ func (w *ExternalWatcher) Register(key types.NamespacedName, config ResourceConf
 
 // Unregister stops watching the external state for the given resource.
 // No-op if the key is not registered. Goroutine-safe.
+//
+// When WithAutoRegister is enabled, this method is a no-op — auto-register
+// manages the full lifecycle via informer events.
 func (w *ExternalWatcher) Unregister(key types.NamespacedName) {
+	if w.autoRegister != nil {
+		w.logger.Info(
+			"Unregister called while WithAutoRegister is enabled; "+
+				"call ignored — use either auto-register or manual Register/Unregister, not both",
+			"resource", key.String(),
+		)
+		return
+	}
+	w.doUnregister(key)
+}
+
+func (w *ExternalWatcher) doUnregister(key types.NamespacedName) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 

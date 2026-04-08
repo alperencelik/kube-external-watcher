@@ -800,3 +800,48 @@ func TestAutoRegister_RetryOnUpdateNotRegistered(t *testing.T) {
 		t.Fatal("expected retry to start on Update when not ready and not registered")
 	}
 }
+
+// Auto-register vs manual register guardrails
+
+func TestAutoRegister_ManualRegisterNoOpWhenAutoRegisterEnabled(t *testing.T) {
+	w, _, _, _ := setupTestWatcher(t, func(obj client.Object) ResourceConfig {
+		return ResourceConfig{ResourceKey: "resource-" + obj.GetName()}
+	})
+
+	cancel := startTestWatcher(t, w)
+	defer cancel()
+
+	key := types.NamespacedName{Namespace: "default", Name: "manual-register"}
+
+	// Manual Register should be a no-op when auto-register is enabled.
+	w.Register(key, ResourceConfig{ResourceKey: "manual"})
+
+	if w.IsRegistered(key) {
+		t.Fatal("expected manual Register to be a no-op when auto-register is enabled")
+	}
+}
+
+func TestAutoRegister_ManualUnregisterNoOpWhenAutoRegisterEnabled(t *testing.T) {
+	w, fi, _, _ := setupTestWatcher(t, func(obj client.Object) ResourceConfig {
+		return ResourceConfig{ResourceKey: "resource-" + obj.GetName()}
+	})
+
+	cancel := startTestWatcher(t, w)
+	defer cancel()
+
+	// Auto-register a resource via informer Add event.
+	obj := newTestObj("default", "auto-registered")
+	fi.handler.OnAdd(obj, false)
+
+	key := types.NamespacedName{Namespace: "default", Name: "auto-registered"}
+	if !w.IsRegistered(key) {
+		t.Fatal("expected resource to be registered via auto-register")
+	}
+
+	// Manual Unregister should be a no-op.
+	w.Unregister(key)
+
+	if !w.IsRegistered(key) {
+		t.Fatal("expected manual Unregister to be a no-op when auto-register is enabled")
+	}
+}
