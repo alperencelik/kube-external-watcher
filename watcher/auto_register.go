@@ -106,7 +106,7 @@ func setupAutoRegister(ctx context.Context, w *ExternalWatcher) error {
 			}
 			w.cancelReadinessRetry(key)
 			config := w.autoRegister.extractor(cObj)
-			w.Register(key, config)
+			w.doRegister(key, config)
 			w.logger.V(1).Info("auto-registered resource", "resource", key.String())
 		},
 		UpdateFunc: func(oldObj, newObj interface{}) {
@@ -121,7 +121,7 @@ func setupAutoRegister(ctx context.Context, w *ExternalWatcher) error {
 			key := types.NamespacedName{Name: cNew.GetName(), Namespace: cNew.GetNamespace()}
 			if !w.fetcher.IsResourceReadyToWatch(ctx, key) {
 				if w.IsRegistered(key) {
-					w.Unregister(key)
+					w.doUnregister(key)
 					w.logger.V(1).Info("auto-unregistered resource (no longer ready)", "resource", key.String())
 				} else {
 					w.logger.V(2).Info("auto-register: resource not ready on update, starting retry", "resource", key.String())
@@ -131,7 +131,7 @@ func setupAutoRegister(ctx context.Context, w *ExternalWatcher) error {
 			}
 			w.cancelReadinessRetry(key)
 			config := w.autoRegister.extractor(cNew)
-			w.Register(key, config)
+			w.doRegister(key, config)
 			w.logger.V(2).Info("auto-register updated resource config", "resource", key.String())
 		},
 		DeleteFunc: func(obj interface{}) {
@@ -147,7 +147,7 @@ func setupAutoRegister(ctx context.Context, w *ExternalWatcher) error {
 			}
 			key := types.NamespacedName{Name: cObj.GetName(), Namespace: cObj.GetNamespace()}
 			w.cancelReadinessRetry(key)
-			w.Unregister(key)
+			w.doUnregister(key)
 			w.logger.V(1).Info("auto-unregistered resource", "resource", key.String())
 		},
 	})
@@ -200,7 +200,7 @@ func (w *ExternalWatcher) startReadinessRetry(ctx context.Context, key types.Nam
 			attempts++
 			if w.fetcher.IsResourceReadyToWatch(retryCtx, key) {
 				config := ar.extractor(objCopy)
-				w.Register(key, config)
+				w.doRegister(key, config)
 				w.logger.V(1).Info("auto-register: resource became ready after retry",
 					"resource", key.String(), "attempts", attempts)
 				return
