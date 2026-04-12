@@ -176,17 +176,11 @@ func (w *ExternalWatcher) doRegister(key types.NamespacedName, config ResourceCo
 // Unregister stops watching the external state for the given resource.
 // No-op if the key is not registered. Goroutine-safe.
 //
-// When WithAutoRegister is enabled, this method is a no-op — auto-register
-// manages the full lifecycle via informer events.
+// When WithAutoRegister is enabled, the resource is unregistered immediately
+// but may be re-registered automatically on the next informer event if the
+// resource still exists and is ready. This allows controllers to temporarily
+// stop watching during operations like deletion or terminal errors.
 func (w *ExternalWatcher) Unregister(key types.NamespacedName) {
-	if w.autoRegister != nil {
-		w.logger.Info(
-			"Unregister called while WithAutoRegister is enabled; "+
-				"call ignored — use either auto-register or manual Register/Unregister, not both",
-			"resource", key.String(),
-		)
-		return
-	}
 	w.doUnregister(key)
 }
 

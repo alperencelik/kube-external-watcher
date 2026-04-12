@@ -821,7 +821,7 @@ func TestAutoRegister_ManualRegisterNoOpWhenAutoRegisterEnabled(t *testing.T) {
 	}
 }
 
-func TestAutoRegister_ManualUnregisterNoOpWhenAutoRegisterEnabled(t *testing.T) {
+func TestAutoRegister_ManualUnregisterAllowedWhenAutoRegisterEnabled(t *testing.T) {
 	w, fi, _, _ := setupTestWatcher(t, func(obj client.Object) ResourceConfig {
 		return ResourceConfig{ResourceKey: "resource-" + obj.GetName()}
 	})
@@ -838,10 +838,17 @@ func TestAutoRegister_ManualUnregisterNoOpWhenAutoRegisterEnabled(t *testing.T) 
 		t.Fatal("expected resource to be registered via auto-register")
 	}
 
-	// Manual Unregister should be a no-op.
+	// Manual Unregister should work even with auto-register enabled.
 	w.Unregister(key)
 
+	if w.IsRegistered(key) {
+		t.Fatal("expected manual Unregister to stop watching the resource")
+	}
+
+	// Auto-register should re-register on the next informer Update event.
+	fi.handler.OnUpdate(obj, obj)
+
 	if !w.IsRegistered(key) {
-		t.Fatal("expected manual Unregister to be a no-op when auto-register is enabled")
+		t.Fatal("expected auto-register to re-register the resource on update event")
 	}
 }
