@@ -35,7 +35,7 @@ type FakeResourceStateFetcher struct {
 	resourceCalls  []ResourceFetchCall
 
 	readyToWatch map[types.NamespacedName]bool // per-resource readiness; default true
-	transformFn  func(any) (any, error)       // optional transform; default identity
+	transformFn  func(any) (any, error)        // optional transform; default identity
 }
 
 // Compile-time interface check.
@@ -44,11 +44,11 @@ var _ watcher.ResourceStateFetcher = (*FakeResourceStateFetcher)(nil)
 // NewFakeResourceStateFetcher creates a new FakeResourceStateFetcher with empty state.
 func NewFakeResourceStateFetcher() *FakeResourceStateFetcher {
 	return &FakeResourceStateFetcher{
-		desiredStates: make(map[types.NamespacedName]any),
-		desiredErrors: make(map[types.NamespacedName]error),
-		resourceStates:   make(map[string]any),
-		resourceErrors:   make(map[string]error),
-		readyToWatch:  make(map[types.NamespacedName]bool),
+		desiredStates:  make(map[types.NamespacedName]any),
+		desiredErrors:  make(map[types.NamespacedName]error),
+		resourceStates: make(map[string]any),
+		resourceErrors: make(map[string]error),
+		readyToWatch:   make(map[types.NamespacedName]bool),
 	}
 }
 

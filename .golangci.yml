@@ -7,11 +7,13 @@ linters:
     - ineffassign
     - staticcheck
     - unused
-    - gosimple
     - gocritic
     - misspell
     - unconvert
     - unparam
+
+formatters:
+  enable:
     - gofmt
     - goimports
 

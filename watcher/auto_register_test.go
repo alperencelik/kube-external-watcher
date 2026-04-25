@@ -45,11 +45,11 @@ func (f *fakeCache) GetInformer(_ context.Context, _ client.Object, _ ...cache.I
 // helpers
 
 // newTestObj creates an objectReference for use as a simulated informer event.
-func newTestObj(ns, name string) client.Object {
+func newTestObj(name string) client.Object {
 	return &objectReference{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
-			Namespace: ns,
+			Namespace: "default",
 		},
 	}
 }
@@ -96,7 +96,7 @@ func setupTestWatcher(t *testing.T, extractor ConfigExtractorFn) (*ExternalWatch
 }
 
 // setupTestWatcherWithFilter is like setupTestWatcher but attaches an EventFilter.
-func setupTestWatcherWithFilter(t *testing.T, extractor ConfigExtractorFn, filter EventFilter) (*ExternalWatcher, *fakeInformer, chan event.GenericEvent, *testFetcher) {
+func setupTestWatcherWithFilter(t *testing.T, extractor ConfigExtractorFn, filter EventFilter) (*ExternalWatcher, *fakeInformer) {
 	t.Helper()
 	fi := &fakeInformer{}
 	fc := &fakeCache{informer: fi}
@@ -131,7 +131,7 @@ func setupTestWatcherWithFilter(t *testing.T, extractor ConfigExtractorFn, filte
 		t.Fatalf("setupAutoRegister failed: %v", err)
 	}
 
-	return w, fi, w.eventCh, fetcher
+	return w, fi
 }
 
 // isRetryPending returns whether a readiness retry goroutine is active for the given key.
@@ -188,7 +188,7 @@ func TestAutoRegister_AddEventRegistersResource(t *testing.T) {
 	w.mu.Unlock()
 
 	// Simulate an Add event from the informer.
-	obj := newTestObj("default", "my-resource")
+	obj := newTestObj("my-resource")
 	fi.handler.OnAdd(obj, false)
 
 	key := types.NamespacedName{Namespace: "default", Name: "my-resource"}
@@ -224,7 +224,7 @@ func TestAutoRegister_UpdateEventUpdatesConfig(t *testing.T) {
 	w.started = true
 	w.mu.Unlock()
 
-	obj := newTestObj("default", "updatable")
+	obj := newTestObj("updatable")
 
 	// Add then Update.
 	fi.handler.OnAdd(obj, false)
@@ -253,7 +253,7 @@ func TestAutoRegister_DeleteEventUnregistersResource(t *testing.T) {
 	w.started = true
 	w.mu.Unlock()
 
-	obj := newTestObj("default", "to-delete")
+	obj := newTestObj("to-delete")
 
 	// Add then Delete.
 	fi.handler.OnAdd(obj, false)
@@ -282,7 +282,7 @@ func TestAutoRegister_DeleteTombstoneHandled(t *testing.T) {
 	w.started = true
 	w.mu.Unlock()
 
-	obj := newTestObj("default", "tombstone-obj")
+	obj := newTestObj("tombstone-obj")
 	fi.handler.OnAdd(obj, false)
 
 	key := types.NamespacedName{Namespace: "default", Name: "tombstone-obj"}
@@ -339,7 +339,7 @@ func TestAutoRegister_NotReadySkipsRegistration(t *testing.T) {
 	cancel := startTestWatcher(t, w)
 	defer cancel()
 
-	obj := newTestObj("default", "not-ready")
+	obj := newTestObj("not-ready")
 	fi.handler.OnAdd(obj, false)
 
 	key := types.NamespacedName{Namespace: "default", Name: "not-ready"}
@@ -361,7 +361,7 @@ func TestAutoRegister_BecomesReadyOnUpdate(t *testing.T) {
 	cancel := startTestWatcher(t, w)
 	defer cancel()
 
-	obj := newTestObj("default", "deferred")
+	obj := newTestObj("deferred")
 	key := types.NamespacedName{Namespace: "default", Name: "deferred"}
 
 	// Add while not ready — should be skipped.
@@ -399,7 +399,7 @@ func TestAutoRegister_UnregistersWhenNoLongerReady(t *testing.T) {
 	cancel := startTestWatcher(t, w)
 	defer cancel()
 
-	obj := newTestObj("default", "transient")
+	obj := newTestObj("transient")
 	key := types.NamespacedName{Namespace: "default", Name: "transient"}
 
 	// Add while ready — should register.
@@ -420,7 +420,7 @@ func TestAutoRegister_UnregistersWhenNoLongerReady(t *testing.T) {
 }
 
 func TestAutoRegister_FilterBlocksAddEvent(t *testing.T) {
-	w, fi, _, _ := setupTestWatcherWithFilter(t,
+	w, fi := setupTestWatcherWithFilter(t,
 		func(obj client.Object) ResourceConfig {
 			return ResourceConfig{ResourceKey: "resource-" + obj.GetName()}
 		},
@@ -435,20 +435,20 @@ func TestAutoRegister_FilterBlocksAddEvent(t *testing.T) {
 	defer cancel()
 
 	// "blocked" should be filtered out.
-	fi.handler.OnAdd(newTestObj("default", "blocked"), false)
+	fi.handler.OnAdd(newTestObj("blocked"), false)
 	if w.IsRegistered(types.NamespacedName{Namespace: "default", Name: "blocked"}) {
 		t.Fatal("expected filtered Add to be skipped")
 	}
 
 	// "allowed" should pass through.
-	fi.handler.OnAdd(newTestObj("default", "allowed"), false)
+	fi.handler.OnAdd(newTestObj("allowed"), false)
 	if !w.IsRegistered(types.NamespacedName{Namespace: "default", Name: "allowed"}) {
 		t.Fatal("expected non-filtered Add to register")
 	}
 }
 
 func TestAutoRegister_FilterBlocksUpdateEvent(t *testing.T) {
-	w, fi, _, _ := setupTestWatcherWithFilter(t,
+	w, fi := setupTestWatcherWithFilter(t,
 		func(obj client.Object) ResourceConfig {
 			return ResourceConfig{ResourceKey: "resource-" + obj.GetName()}
 		},
@@ -464,7 +464,7 @@ func TestAutoRegister_FilterBlocksUpdateEvent(t *testing.T) {
 	defer cancel()
 
 	// Add the resource first (no Update filter on Add).
-	obj := newTestObj("default", "gen-test")
+	obj := newTestObj("gen-test")
 	fi.handler.OnAdd(obj, false)
 
 	key := types.NamespacedName{Namespace: "default", Name: "gen-test"}
@@ -479,7 +479,7 @@ func TestAutoRegister_FilterBlocksUpdateEvent(t *testing.T) {
 		return ResourceConfig{ResourceKey: "resource-" + obj.GetName()}
 	}
 
-	sameGen := newTestObj("default", "gen-test")
+	sameGen := newTestObj("gen-test")
 	fi.handler.OnUpdate(obj, sameGen)
 	if callCount != 0 {
 		t.Errorf("expected extractor not called for same-generation update, got %d calls", callCount)
@@ -500,7 +500,7 @@ func TestAutoRegister_FilterBlocksUpdateEvent(t *testing.T) {
 }
 
 func TestAutoRegister_FilterBlocksDeleteEvent(t *testing.T) {
-	w, fi, _, _ := setupTestWatcherWithFilter(t,
+	w, fi := setupTestWatcherWithFilter(t,
 		func(obj client.Object) ResourceConfig {
 			return ResourceConfig{ResourceKey: "resource-" + obj.GetName()}
 		},
@@ -515,15 +515,15 @@ func TestAutoRegister_FilterBlocksDeleteEvent(t *testing.T) {
 	defer cancel()
 
 	// Register two resources.
-	fi.handler.OnAdd(newTestObj("default", "keep-me"), false)
-	fi.handler.OnAdd(newTestObj("default", "remove-me"), false)
+	fi.handler.OnAdd(newTestObj("keep-me"), false)
+	fi.handler.OnAdd(newTestObj("remove-me"), false)
 
 	keepKey := types.NamespacedName{Namespace: "default", Name: "keep-me"}
 	removeKey := types.NamespacedName{Namespace: "default", Name: "remove-me"}
 
 	// Delete both — only "remove-me" should actually unregister.
-	fi.handler.OnDelete(newTestObj("default", "keep-me"))
-	fi.handler.OnDelete(newTestObj("default", "remove-me"))
+	fi.handler.OnDelete(newTestObj("keep-me"))
+	fi.handler.OnDelete(newTestObj("remove-me"))
 
 	if !w.IsRegistered(keepKey) {
 		t.Fatal("expected 'keep-me' to remain registered (delete was filtered)")
@@ -542,7 +542,7 @@ func TestAutoRegister_NilFilterAllowsAll(t *testing.T) {
 	cancel := startTestWatcher(t, w)
 	defer cancel()
 
-	fi.handler.OnAdd(newTestObj("default", "no-filter"), false)
+	fi.handler.OnAdd(newTestObj("no-filter"), false)
 	if !w.IsRegistered(types.NamespacedName{Namespace: "default", Name: "no-filter"}) {
 		t.Fatal("expected resource registered when no filter is set")
 	}
@@ -562,7 +562,7 @@ func TestAutoRegister_RetryRegistersWhenReady(t *testing.T) {
 	cancel := startTestWatcher(t, w)
 	defer cancel()
 
-	obj := newTestObj("default", "slow-provision")
+	obj := newTestObj("slow-provision")
 	key := types.NamespacedName{Namespace: "default", Name: "slow-provision"}
 
 	// Add while not ready — should start retry.
@@ -570,7 +570,7 @@ func TestAutoRegister_RetryRegistersWhenReady(t *testing.T) {
 	if w.IsRegistered(key) {
 		t.Fatal("expected resource not registered immediately when not ready")
 	}
-	if !isRetryPending(w,key) {
+	if !isRetryPending(w, key) {
 		t.Fatal("expected retry to be pending after Add when not ready")
 	}
 
@@ -605,14 +605,14 @@ func TestAutoRegister_RetryNoDuplicateForSameKey(t *testing.T) {
 	cancel := startTestWatcher(t, w)
 	defer cancel()
 
-	obj := newTestObj("default", "dup-retry")
+	obj := newTestObj("dup-retry")
 	key := types.NamespacedName{Namespace: "default", Name: "dup-retry"}
 
 	// Fire two Add events for the same key.
 	fi.handler.OnAdd(obj, false)
 	fi.handler.OnAdd(obj, false)
 
-	if !isRetryPending(w,key) {
+	if !isRetryPending(w, key) {
 		t.Fatal("expected retry to be pending")
 	}
 
@@ -637,11 +637,11 @@ func TestAutoRegister_RetryCancelledOnDelete(t *testing.T) {
 	cancel := startTestWatcher(t, w)
 	defer cancel()
 
-	obj := newTestObj("default", "delete-during-retry")
+	obj := newTestObj("delete-during-retry")
 	key := types.NamespacedName{Namespace: "default", Name: "delete-during-retry"}
 
 	fi.handler.OnAdd(obj, false)
-	if !isRetryPending(w,key) {
+	if !isRetryPending(w, key) {
 		t.Fatal("expected retry to be pending after Add")
 	}
 
@@ -666,12 +666,12 @@ func TestAutoRegister_RetryCancelledWhenUpdateMakesReady(t *testing.T) {
 	cancel := startTestWatcher(t, w)
 	defer cancel()
 
-	obj := newTestObj("default", "update-ready")
+	obj := newTestObj("update-ready")
 	key := types.NamespacedName{Namespace: "default", Name: "update-ready"}
 
 	// Add while not ready — starts retry.
 	fi.handler.OnAdd(obj, false)
-	if !isRetryPending(w,key) {
+	if !isRetryPending(w, key) {
 		t.Fatal("expected retry pending after Add")
 	}
 
@@ -732,11 +732,11 @@ func TestAutoRegister_RetryCancelledOnShutdown(t *testing.T) {
 	w.started = true
 	w.mu.Unlock()
 
-	obj := newTestObj("default", "shutdown-retry")
+	obj := newTestObj("shutdown-retry")
 	key := types.NamespacedName{Namespace: "default", Name: "shutdown-retry"}
 
 	fi.handler.OnAdd(obj, false)
-	if !isRetryPending(w,key) {
+	if !isRetryPending(w, key) {
 		t.Fatal("expected retry pending after Add")
 	}
 
@@ -761,11 +761,11 @@ func TestAutoRegister_RetryMaxRetriesGivesUp(t *testing.T) {
 	cancel := startTestWatcher(t, w)
 	defer cancel()
 
-	obj := newTestObj("default", "max-retry")
+	obj := newTestObj("max-retry")
 	key := types.NamespacedName{Namespace: "default", Name: "max-retry"}
 
 	fi.handler.OnAdd(obj, false)
-	if !isRetryPending(w,key) {
+	if !isRetryPending(w, key) {
 		t.Fatal("expected retry pending after Add")
 	}
 
@@ -787,7 +787,7 @@ func TestAutoRegister_RetryOnUpdateNotRegistered(t *testing.T) {
 	cancel := startTestWatcher(t, w)
 	defer cancel()
 
-	obj := newTestObj("default", "update-not-registered")
+	obj := newTestObj("update-not-registered")
 	key := types.NamespacedName{Namespace: "default", Name: "update-not-registered"}
 
 	// Send an Update event for a resource that was never registered.
@@ -796,7 +796,7 @@ func TestAutoRegister_RetryOnUpdateNotRegistered(t *testing.T) {
 	if w.IsRegistered(key) {
 		t.Fatal("expected resource not registered when not ready")
 	}
-	if !isRetryPending(w,key) {
+	if !isRetryPending(w, key) {
 		t.Fatal("expected retry to start on Update when not ready and not registered")
 	}
 }
@@ -830,7 +830,7 @@ func TestAutoRegister_ManualUnregisterAllowedWhenAutoRegisterEnabled(t *testing.
 	defer cancel()
 
 	// Auto-register a resource via informer Add event.
-	obj := newTestObj("default", "auto-registered")
+	obj := newTestObj("auto-registered")
 	fi.handler.OnAdd(obj, false)
 
 	key := types.NamespacedName{Namespace: "default", Name: "auto-registered"}

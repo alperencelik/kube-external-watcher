@@ -17,15 +17,15 @@ import (
 // testFetcher is an in-package fake ResourceStateFetcher for testing
 // resourceWatcher directly. It is goroutine-safe.
 type testFetcher struct {
-	mu           sync.RWMutex
-	desiredState any
-	resourceState   any
-	desiredErr   error
-	resourceErr     error
-	desiredCalls atomic.Int64
-	resourceCalls   atomic.Int64
-	ready        bool                      // controls IsResourceReadyToWatch; default false (set to true in helpers)
-	transformFn  func(any) (any, error)    // optional transform; default identity
+	mu            sync.RWMutex
+	desiredState  any
+	resourceState any
+	desiredErr    error
+	resourceErr   error
+	desiredCalls  atomic.Int64
+	resourceCalls atomic.Int64
+	ready         bool                   // controls IsResourceReadyToWatch; default false (set to true in helpers)
+	transformFn   func(any) (any, error) // optional transform; default identity
 }
 
 func (f *testFetcher) setDesiredState(s any) {

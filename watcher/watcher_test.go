@@ -13,20 +13,16 @@ import (
 	"github.com/alperencelik/kube-external-watcher/watcher"
 )
 
-// waitForEvents drains n events from ch or fails after timeout.
-func waitForEvents(t *testing.T, ch <-chan event.GenericEvent, n int, timeout time.Duration) []event.GenericEvent {
+// waitForEvents waits for one event from ch or fails after a 2s timeout.
+func waitForEvents(t *testing.T, ch <-chan event.GenericEvent) []event.GenericEvent {
 	t.Helper()
-	var events []event.GenericEvent
-	deadline := time.After(timeout)
-	for range n {
-		select {
-		case evt := <-ch:
-			events = append(events, evt)
-		case <-deadline:
-			t.Fatalf("timed out after %v: got %d events, expected %d", timeout, len(events), n)
-		}
+	select {
+	case evt := <-ch:
+		return []event.GenericEvent{evt}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for event")
 	}
-	return events
+	return nil
 }
 
 // drainEvents returns all events available within the given window.
@@ -68,10 +64,10 @@ func TestExternalWatcher_RegisterBeforeStart(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go ew.Start(ctx)
+	go func() { _ = ew.Start(ctx) }()
 
 	// The pre-registered watcher should detect drift on start.
-	events := waitForEvents(t, ch, 1, 2*time.Second)
+	events := waitForEvents(t, ch)
 	if eventKey(events[0]) != key {
 		t.Errorf("expected event for %v, got %v", key, eventKey(events[0]))
 	}
@@ -92,7 +88,7 @@ func TestExternalWatcher_RegisterAfterStart(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go ew.Start(ctx)
+	go func() { _ = ew.Start(ctx) }()
 
 	// Brief wait for Start to execute.
 	time.Sleep(50 * time.Millisecond)
@@ -100,7 +96,7 @@ func TestExternalWatcher_RegisterAfterStart(t *testing.T) {
 	// Register after Start.
 	ew.Register(key, watcher.ResourceConfig{ResourceKey: resourceKey})
 
-	waitForEvents(t, ch, 1, 2*time.Second)
+	waitForEvents(t, ch)
 }
 
 func TestExternalWatcher_Unregister(t *testing.T) {
@@ -118,12 +114,12 @@ func TestExternalWatcher_Unregister(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go ew.Start(ctx)
+	go func() { _ = ew.Start(ctx) }()
 
 	ew.Register(key, watcher.ResourceConfig{ResourceKey: resourceKey})
 
 	// Wait for initial drift event.
-	waitForEvents(t, ch, 1, 2*time.Second)
+	waitForEvents(t, ch)
 
 	// Unregister and verify no more events.
 	ew.Unregister(key)
@@ -195,7 +191,7 @@ func TestExternalWatcher_PerResourcePollInterval(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go ew.Start(ctx)
+	go func() { _ = ew.Start(ctx) }()
 
 	// Register with a short per-resource interval (overriding the 1h default).
 	ew.Register(key, watcher.ResourceConfig{
@@ -204,7 +200,7 @@ func TestExternalWatcher_PerResourcePollInterval(t *testing.T) {
 	})
 
 	// Should get drift event quickly.
-	waitForEvents(t, ch, 1, 2*time.Second)
+	waitForEvents(t, ch)
 
 	// Fix cloud state to match K8s, then break it again.
 	fetcher.SetResourceState(resourceKey, "desired")
@@ -212,7 +208,7 @@ func TestExternalWatcher_PerResourcePollInterval(t *testing.T) {
 
 	fetcher.SetResourceState(resourceKey, "changed-again")
 
-	waitForEvents(t, ch, 1, 2*time.Second)
+	waitForEvents(t, ch)
 }
 
 func TestExternalWatcher_ReRegisterUpdatesConfig(t *testing.T) {
@@ -230,11 +226,11 @@ func TestExternalWatcher_ReRegisterUpdatesConfig(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go ew.Start(ctx)
+	go func() { _ = ew.Start(ctx) }()
 
 	// Register, wait for initial drift event.
 	ew.Register(key, watcher.ResourceConfig{ResourceKey: resourceKey})
-	waitForEvents(t, ch, 1, 2*time.Second)
+	waitForEvents(t, ch)
 
 	// Re-register (update config) — should not panic or duplicate.
 	ew.Register(key, watcher.ResourceConfig{
@@ -256,7 +252,7 @@ func TestExternalWatcher_ConcurrentRegisterUnregister(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go ew.Start(ctx)
+	go func() { _ = ew.Start(ctx) }()
 	time.Sleep(50 * time.Millisecond)
 
 	var wg sync.WaitGroup
@@ -296,7 +292,7 @@ func TestExternalWatcher_GracefulShutdown(t *testing.T) {
 	}()
 
 	ew.Register(key, watcher.ResourceConfig{ResourceKey: resourceKey})
-	waitForEvents(t, ch, 1, 2*time.Second)
+	waitForEvents(t, ch)
 
 	// Cancel context — Start should return promptly.
 	cancel()
@@ -333,13 +329,13 @@ func TestExternalWatcher_EndToEnd(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go ew.Start(ctx)
+	go func() { _ = ew.Start(ctx) }()
 
 	// 1. Register resource.
 	ew.Register(key, watcher.ResourceConfig{ResourceKey: resourceKey})
 
 	// 2. Wait for initial drift event (kube says "running", cloud says "stopped").
-	events := waitForEvents(t, ch, 1, 2*time.Second)
+	events := waitForEvents(t, ch)
 	if eventKey(events[0]) != key {
 		t.Errorf("expected event for %v, got %v", key, eventKey(events[0]))
 	}
@@ -353,7 +349,7 @@ func TestExternalWatcher_EndToEnd(t *testing.T) {
 
 	// 4. Introduce new drift — cloud state changes.
 	fetcher.SetResourceState(resourceKey, map[string]string{"status": "terminated", "version": "14.2"})
-	events = waitForEvents(t, ch, 1, 2*time.Second)
+	events = waitForEvents(t, ch)
 	if eventKey(events[0]) != key {
 		t.Errorf("expected event for %v, got %v", key, eventKey(events[0]))
 	}
