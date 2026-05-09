@@ -504,6 +504,49 @@ func TestResourceWatcher_StatusUpdaterErrorDoesNotBlockPoll(t *testing.T) {
 	}
 }
 
+func TestResourceWatcher_LastDriftPopulatedAndCleared(t *testing.T) {
+	eventCh := make(chan event.GenericEvent, 10)
+	fetcher := &testFetcher{}
+	fetcher.setDesiredState("running")
+	fetcher.setResourceState("stopped")
+	key := types.NamespacedName{Namespace: "ns", Name: "db"}
+
+	rw := newResourceWatcher(key, "rk", 1*time.Hour, fetcher, NewDeepEqualComparator(), eventCh, logr.Discard(), nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if _, ok := rw.getLastDrift(); ok {
+		t.Fatal("expected no drift before any poll")
+	}
+
+	rw.poll(ctx)
+	<-eventCh // drain the event
+
+	info, ok := rw.getLastDrift()
+	if !ok {
+		t.Fatal("expected drift to be recorded after drifted poll")
+	}
+	if info.Key != key {
+		t.Errorf("DriftInfo.Key = %v, want %v", info.Key, key)
+	}
+	if info.DetectedAt.IsZero() {
+		t.Error("DriftInfo.DetectedAt should not be zero")
+	}
+	if info.Diff == "" {
+		t.Error("expected DriftInfo.Diff to be populated by DeepEqualComparator")
+	}
+
+	// External resource is brought back into compliance — next poll should
+	// observe no drift and clear the recorded entry.
+	fetcher.setResourceState("running")
+	rw.poll(ctx)
+
+	if _, ok := rw.getLastDrift(); ok {
+		t.Error("expected last drift to be cleared after clean poll")
+	}
+}
+
 func TestResourceWatcher_WithoutStatusUpdaterStillWorks(t *testing.T) {
 	// testFetcher does NOT implement ResourceStatusUpdater — poll should work normally.
 	eventCh := make(chan event.GenericEvent, 10)

@@ -1,6 +1,7 @@
 package watcher
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/google/go-cmp/cmp/cmpopts"
@@ -119,6 +120,22 @@ func TestDeepEqualComparator_WithCmpOptions(t *testing.T) {
 	}
 	if !drifted {
 		t.Error("expected drift when status changed")
+	}
+}
+
+func TestDeepEqualComparator_Diff(t *testing.T) {
+	c := NewDeepEqualComparator()
+	out := c.Diff(map[string]string{"status": "running"}, map[string]string{"status": "stopped"})
+	if out == "" {
+		t.Fatal("expected non-empty diff for differing states")
+	}
+	// cmp.Diff output should mention both values somewhere.
+	if !strings.Contains(out, "running") || !strings.Contains(out, "stopped") {
+		t.Errorf("diff missing expected values: %q", out)
+	}
+
+	if got := c.Diff("x", "x"); got != "" {
+		t.Errorf("expected empty diff for equal states, got %q", got)
 	}
 }
 

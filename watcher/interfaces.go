@@ -70,6 +70,12 @@ type StateComparator interface {
 	// in a way that should trigger reconciliation. Both inputs should
 	// already be in the same shape (transformation is done upstream).
 	HasDrifted(desired, actual any) (bool, error)
+
+	// Diff returns a human-readable summary of the difference between
+	// desired and actual. Used to populate DriftInfo.Diff for callers
+	// emitting Kubernetes Events or status messages. May be empty if
+	// the implementation cannot meaningfully describe the difference.
+	Diff(desired, actual any) string
 }
 
 // WatcherManager defines the interface for registering and unregistering

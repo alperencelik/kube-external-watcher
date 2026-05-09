@@ -203,3 +203,23 @@ func (w *ExternalWatcher) IsRegistered(key types.NamespacedName) bool {
 	_, ok := w.watchers[key]
 	return ok
 }
+
+// LastDrift returns the most recently observed drift for the given
+// resource, if any. It is intended to be called from a reconciler that
+// was triggered via EventChannel — the returned DriftInfo carries the
+// timestamp and (when the comparator implements StateDiffer) a
+// human-readable diff. The bool return is false when the resource is
+// not registered or its last poll observed no drift.
+//
+// The watcher auto-clears the entry when a subsequent poll finds the
+// states matching again, so steady-state reconciles after a successful
+// fix observe (DriftInfo{}, false). Goroutine-safe.
+func (w *ExternalWatcher) LastDrift(key types.NamespacedName) (DriftInfo, bool) {
+	w.mu.RLock()
+	rw, ok := w.watchers[key]
+	w.mu.RUnlock()
+	if !ok {
+		return DriftInfo{}, false
+	}
+	return rw.getLastDrift()
+}
