@@ -26,3 +26,8 @@ func NewDeepEqualComparator(opts ...cmp.Option) *DeepEqualComparator {
 func (c *DeepEqualComparator) HasDrifted(desired, actual any) (bool, error) {
 	return !cmp.Equal(desired, actual, c.opts...), nil
 }
+
+// Diff returns the between the desired and actual state
+func (c *DeepEqualComparator) Diff(desired, actual any) string {
+	return cmp.Diff(desired, actual, c.opts...)
+}

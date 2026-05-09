@@ -362,3 +362,79 @@ func TestExternalWatcher_EndToEnd(t *testing.T) {
 		t.Errorf("expected no events after unregister, got %d", len(extra))
 	}
 }
+
+func TestExternalWatcher_LastDriftLookup(t *testing.T) {
+	fetcher := mock.NewFakeResourceStateFetcher()
+	key := types.NamespacedName{Namespace: "ns", Name: "drift-lookup"}
+	resourceKey := "resource-drift-lookup"
+	fetcher.SetDesiredState(key, "running")
+	fetcher.SetResourceState(resourceKey, "stopped")
+
+	ew := watcher.NewExternalWatcher(fetcher,
+		watcher.WithDefaultPollInterval(30*time.Millisecond),
+		watcher.WithEventChannelBufferSize(10),
+	)
+	ch := ew.EventChannel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = ew.Start(ctx) }()
+
+	// Unknown key returns false.
+	if _, ok := ew.LastDrift(types.NamespacedName{Name: "missing"}); ok {
+		t.Error("expected LastDrift on unknown key to return false")
+	}
+
+	ew.Register(key, watcher.ResourceConfig{ResourceKey: resourceKey})
+	waitForEvents(t, ch)
+
+	// Reconciler-style lookup: a drift was just observed.
+	info, ok := ew.LastDrift(key)
+	if !ok {
+		t.Fatal("expected LastDrift to return drift info after a drifted poll")
+	}
+	if info.Key != key {
+		t.Errorf("DriftInfo.Key = %v, want %v", info.Key, key)
+	}
+	if info.Diff == "" {
+		t.Error("expected non-empty Diff from default DeepEqualComparator")
+	}
+}
+
+func TestExternalWatcher_LastDriftAutoClearedOnCleanPoll(t *testing.T) {
+	fetcher := mock.NewFakeResourceStateFetcher()
+	key := types.NamespacedName{Namespace: "ns", Name: "auto-clear"}
+	resourceKey := "resource-auto-clear"
+	fetcher.SetDesiredState(key, "v1")
+	fetcher.SetResourceState(resourceKey, "v2")
+
+	ew := watcher.NewExternalWatcher(fetcher,
+		watcher.WithDefaultPollInterval(30*time.Millisecond),
+		watcher.WithEventChannelBufferSize(10),
+	)
+	ch := ew.EventChannel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = ew.Start(ctx) }()
+
+	ew.Register(key, watcher.ResourceConfig{ResourceKey: resourceKey})
+	waitForEvents(t, ch)
+
+	if _, ok := ew.LastDrift(key); !ok {
+		t.Fatal("expected drift recorded after first drifted poll")
+	}
+
+	// External resource brought back into compliance — next poll observes
+	// no drift and auto-clears the entry.
+	fetcher.SetResourceState(resourceKey, "v1")
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, ok := ew.LastDrift(key); !ok {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("timed out waiting for LastDrift to auto-clear after clean poll")
+}

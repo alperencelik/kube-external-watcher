@@ -33,6 +33,11 @@ type resourceWatcher struct {
 	// mu protects pollInterval for dynamic updates.
 	mu           sync.Mutex
 	pollInterval time.Duration
+
+	// driftMu protects lastDrift. It is separate from mu so that callers
+	// of LastDrift do not contend with poll-interval updates.
+	driftMu   sync.RWMutex
+	lastDrift *DriftInfo
 }
 
 func newResourceWatcher(
@@ -81,6 +86,27 @@ func (rw *resourceWatcher) currentPollInterval() time.Duration {
 	rw.mu.Lock()
 	defer rw.mu.Unlock()
 	return rw.pollInterval
+}
+
+func (rw *resourceWatcher) getLastDrift() (DriftInfo, bool) {
+	rw.driftMu.RLock()
+	defer rw.driftMu.RUnlock()
+	if rw.lastDrift == nil {
+		return DriftInfo{}, false
+	}
+	return *rw.lastDrift, true
+}
+
+func (rw *resourceWatcher) setLastDrift(info DriftInfo) {
+	rw.driftMu.Lock()
+	defer rw.driftMu.Unlock()
+	rw.lastDrift = &info
+}
+
+func (rw *resourceWatcher) clearLastDrift() {
+	rw.driftMu.Lock()
+	defer rw.driftMu.Unlock()
+	rw.lastDrift = nil
 }
 
 func (rw *resourceWatcher) run(ctx context.Context) {
@@ -143,6 +169,12 @@ func (rw *resourceWatcher) poll(ctx context.Context) {
 		rw.logger.V(1).Info("drift detected, triggering reconciliation")
 		rw.metrics.incDriftDetected(ns, name)
 
+		rw.setLastDrift(DriftInfo{
+			Key:        rw.key,
+			DetectedAt: time.Now(),
+			Diff:       rw.comparator.Diff(desired, actual),
+		})
+
 		obj := &objectReference{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      rw.key.Name,
@@ -156,6 +188,8 @@ func (rw *resourceWatcher) poll(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		}
+	} else {
+		rw.clearLastDrift()
 	}
 
 	rw.metrics.incPollTotal(ns, name, "success")

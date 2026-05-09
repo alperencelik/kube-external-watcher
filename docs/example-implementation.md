@@ -336,7 +336,7 @@ comparator := watcher.NewDeepEqualComparator(
 
 ### Custom comparator
 
-For full control, implement the `StateComparator` interface directly. Since the fetcher's `TransformExternalState` runs before comparison, both inputs are already in the same shape:
+For full control, implement the `StateComparator` interface directly. Since the fetcher's `TransformExternalState` runs before comparison, both inputs are already in the same shape. `Diff` is used to populate `DriftInfo.Diff` when drift is detected — keep it consistent with `HasDrifted` (any field that can trigger drift should appear in the diff string):
 
 ```go
 type EngineOnlyComparator struct{}
@@ -345,6 +345,15 @@ func (c *EngineOnlyComparator) HasDrifted(desired, actual any) (bool, error) {
     d := desired.(DatabaseState)
     a := actual.(DatabaseState)
     return d.Engine != a.Engine, nil
+}
+
+func (c *EngineOnlyComparator) Diff(desired, actual any) string {
+    d := desired.(DatabaseState)
+    a := actual.(DatabaseState)
+    if d.Engine == a.Engine {
+        return ""
+    }
+    return fmt.Sprintf("Engine: %q -> %q", d.Engine, a.Engine)
 }
 ```
 
@@ -356,3 +365,58 @@ watcher.NewExternalWatcher(dbFetcher,
     // ...
 )
 ```
+
+## 6. Emitting Kubernetes Events on drift (optional)
+
+The watcher signals drift through `EventChannel` (which triggers `Reconcile`) and exposes structured details via `ExternalWatcher.LastDrift(key)`. This lets the reconciler emit a Kubernetes Event with timestamp and a diff string, without the library having to take a dependency on `record.EventRecorder` itself.
+
+To use it, inject the watcher into the reconciler (same shape as the manual-register example) and add an `EventRecorder`:
+
+```go
+// main.go
+recorder := mgr.GetEventRecorderFor("database-controller")
+
+ctrl.NewControllerManagedBy(mgr).
+    For(&myv1.Database{}).
+    WatchesRawSource(
+        source.Channel(ew.EventChannel(), &handler.EnqueueRequestForObject{}),
+    ).
+    Complete(&DatabaseReconciler{
+        Client:   mgr.GetClient(),
+        Watcher:  ew,
+        Recorder: recorder,
+    })
+```
+
+Then in the reconciler, query `LastDrift` and emit when it returns true:
+
+```go
+type DatabaseReconciler struct {
+    client.Client
+    Watcher  *watcher.ExternalWatcher
+    Recorder record.EventRecorder
+}
+
+func (r *DatabaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+    var db myv1.Database
+    if err := r.Get(ctx, req.NamespacedName, &db); err != nil {
+        return ctrl.Result{}, client.IgnoreNotFound(err)
+    }
+
+    // If this reconcile was triggered by drift, surface it as a K8s Event.
+    if d, ok := r.Watcher.LastDrift(req.NamespacedName); ok {
+        r.Recorder.Eventf(&db, corev1.EventTypeWarning, "ExternalDrift",
+            "External resource drifted at %s: %s",
+            d.DetectedAt.Format(time.RFC3339), d.Diff)
+    }
+
+    // ... reconcile cloud state back to desired ...
+    return ctrl.Result{}, nil
+}
+```
+
+Notes:
+
+- `LastDrift` returns `(DriftInfo{}, false)` when no drift is recorded — including when reconcile fires from a regular CR update — so the Event is only emitted on drift-triggered reconciles.
+- `DriftInfo.Diff` is produced by the configured `StateComparator.Diff`. The default `DeepEqualComparator` uses `cmp.Diff` with the same `cmp.Options` it uses for `HasDrifted`, so the diff respects any `IgnoreFields`/`SortSlices` you pass in.
+- The watcher auto-clears the entry on the next poll where states match again, so a follow-up reconcile after a successful fix sees no drift.
