@@ -1,31 +1,27 @@
-# Architecture 
+# Architecture
 
 Currently there is only watcher/ package, which contains all core logic. The main components are:
 
 ### Core Interfaces (watcher/interfaces.go)
 
 - `ResourceStateFetcher` — User implements `GetDesiredState`, `FetchExternalResource`, `TransformExternalState`, and `IsResourceReadyToWatch` to bridge Kubernetes and external resource state. `TransformExternalState` normalizes the raw external API response into the same shape as the desired state.
-- `StateComparator` — `HasDrifted(desired, actual any) (bool, error)`. Receives two same-shaped values (transform is applied upstream by the fetcher for type conversion) and determines if drift occurred. Returns a bool and an error (error = unable to compare, do not trigger reconciliation, but log the error). 
+- `StateComparator` — `HasDrifted(desired, actual any) (bool, error)`. Receives two same-shaped values (transform is applied upstream by the fetcher for type conversion) and determines if drift occurred. Returns a bool and an error (error = unable to compare, do not trigger reconciliation, but log the error).
 - `WatcherManager` — `Register(key, ResourceConfig)`, `Unregister(key)`, `IsRegistered(key) bool`.
 - `ResourceConfig` — Per-resource config. `PollInterval` (zero = global default).
 
 ### ExternalWatcher (watcher/watcher.go)
 
 The central orchestrator. Implements:
-- `manager.Runnable` — `Start(ctx) error`, blocks until shutdown.
-- `manager.LeaderElectionRunnable` — `NeedLeaderElection() = true` (only leader polls).
+- `source.Source` — `Start(ctx, queue) error`. Non-blocking; controller-runtime calls this when the owning controller starts.
 - `WatcherManager` — register/unregister resources at any time.
-
-PS: Currently the leader election is set to true to avoid duplicate external API calls from non-leader replicas. In the future, I might consider distributing the watcher across replicas for distributing the load. But to avoid complexity around state synchronization, the project will stick to leader election for now.
 
 Lifecycle:
 
 1. User creates via `NewExternalWatcher(fetcher, opts...)`.
-2. Added to manager via `mgr.Add(watcher)`.
-3. Event channel wired to controller via `source.Channel(watcher.EventChannel(), handler)`.
-4. On `Start()`: if `WithAutoRegister` is configured, sets up informer event handler. Starts pre-registered watchers, blocks on ctx.
-5. `Register()` can be called before or after Start. Post-start, goroutine spawns immediately.
-6. On shutdown: all resource watchers stopped, map cleared.
+2. Wired into the controller via `WatchesRawSource(watcher)`.
+3. On `Start(ctx, queue)`: if `WithAutoRegister` is configured, sets up informer event handler. Starts pre-registered watchers.
+4. `Register()` can be called before or after Start. Post-start, goroutine spawns immediately and enqueues drift directly onto the controller's workqueue.
+5. On shutdown: all resource watchers stopped, map cleared.
 
 ### Auto-Registration (watcher/auto_register.go)
 
@@ -41,12 +37,12 @@ The informer event handler is set up in `Start()` via `cache.GetInformer()`. Thi
 One goroutine per registered resource:
 
 1. Initial poll on start.
-2. Loop: wait `pollInterval` → `GetDesiredState` → `FetchExternalResource` → `TransformExternalState` → `HasDrifted(desired, transformed)` → send `GenericEvent` if drifted.
+2. Loop: wait `pollInterval` → `GetDesiredState` → `FetchExternalResource` → `TransformExternalState` → `HasDrifted(desired, transformed)` → enqueue `reconcile.Request` on the controller's workqueue if drifted.
 3. Fetch/transform/compare errors logged, do not trigger reconciliation, loop continues.
 
 ### Event Bridge
 
-Uses `source.Channel` with `event.GenericEvent`. The watcher creates a minimal `objectReference` (name + namespace only, satisfies `client.Object`) to identify which resource drifted. `handler.EnqueueRequestForObject` extracts the `NamespacedName` and enqueues a `reconcile.Request`.
+`ExternalWatcher` implements `source.Source` directly. When drift is detected, the resource watcher calls `queue.Add(reconcile.Request{NamespacedName: key})` on the workqueue passed in by controller-runtime when the controller started. No intermediate channel, `event.GenericEvent`, or `client.Object` placeholder is involved.
 
 ### Integration pattern for users
 
@@ -75,13 +71,10 @@ ew := watcher.NewExternalWatcher(myFetcher,
     }),
 )
 
-// 3. Add to manager
-mgr.Add(ew)
-
-// 4. Wire to controller — no manual Register/Unregister needed
+// 3. Wire to controller
 ctrl.NewControllerManagedBy(mgr).
     For(&myv1.Database{}).
-    WatchesRawSource(source.Channel(ew.EventChannel(), &handler.EnqueueRequestForObject{})).
+    WatchesRawSource(ew).
     Complete(myReconciler)
 ```
 
@@ -93,16 +86,13 @@ For cases where you need fine-grained control over when resources are watched, i
 // 1. Create watcher
 ew := watcher.NewExternalWatcher(myFetcher, watcher.WithDefaultPollInterval(30*time.Second))
 
-// 2. Add to manager
-mgr.Add(ew)
-
-// 3. Wire to controller
+// 2. Wire to controller
 ctrl.NewControllerManagedBy(mgr).
     For(&MyCR{}).
-    WatchesRawSource(source.Channel(ew.EventChannel(), &handler.EnqueueRequestForObject{})).
+    WatchesRawSource(ew).
     Complete(&MyReconciler{watcher: ew})
 
-// 4. In reconciler: register/unregister
+// 3. In reconciler: register/unregister
 func (r *MyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
     var cr MyCR
     if err := r.Get(ctx, req.NamespacedName, &cr); err != nil {

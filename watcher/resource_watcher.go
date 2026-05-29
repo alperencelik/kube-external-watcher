@@ -6,21 +6,24 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	"sigs.k8s.io/controller-runtime/pkg/event"
+	"k8s.io/client-go/util/workqueue"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
-// resourceWatcher is a per-resource polling goroutine that gets
-// the desired state from Kubernetes and actual state from an external API, detects drift, and emits GenericEvents.
+// resourceWatcher is a per-resource polling goroutine that gets the
+// desired state from Kubernetes, the actual state from an external API,
+// detects drift, and enqueues a reconcile.Request when drift is found.
 type resourceWatcher struct {
 	key         types.NamespacedName
 	resourceKey any
 
 	fetcher    ResourceStateFetcher
 	comparator StateComparator
-	eventCh    chan<- event.GenericEvent
 	logger     logr.Logger
+
+	// queue is the controller's workqueue, set when start is called.
+	queue workqueue.TypedRateLimitingInterface[reconcile.Request]
 
 	// cancel stops this resource watcher's goroutine.
 	cancel context.CancelFunc
@@ -46,7 +49,6 @@ func newResourceWatcher(
 	pollInterval time.Duration,
 	fetcher ResourceStateFetcher,
 	comparator StateComparator,
-	eventCh chan<- event.GenericEvent,
 	logger logr.Logger,
 	metrics *metricsCollector,
 ) *resourceWatcher {
@@ -56,15 +58,15 @@ func newResourceWatcher(
 		pollInterval: pollInterval,
 		fetcher:      fetcher,
 		comparator:   comparator,
-		eventCh:      eventCh,
 		logger:       logger,
 		metrics:      metrics,
 	}
 }
 
-func (rw *resourceWatcher) start(parentCtx context.Context) {
+func (rw *resourceWatcher) start(parentCtx context.Context, queue workqueue.TypedRateLimitingInterface[reconcile.Request]) {
 	ctx, cancel := context.WithCancel(parentCtx)
 	rw.cancel = cancel
+	rw.queue = queue
 	rw.running = true
 	go rw.run(ctx)
 }
@@ -175,18 +177,9 @@ func (rw *resourceWatcher) poll(ctx context.Context) {
 			Diff:       rw.comparator.Diff(desired, actual),
 		})
 
-		obj := &objectReference{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      rw.key.Name,
-				Namespace: rw.key.Namespace,
-			},
-		}
-
-		select {
-		case rw.eventCh <- event.GenericEvent{Object: obj}:
-			rw.logger.V(2).Info("reconcile event sent")
-		case <-ctx.Done():
-			return
+		if rw.queue != nil {
+			rw.queue.Add(reconcile.Request{NamespacedName: rw.key})
+			rw.logger.V(2).Info("reconcile request enqueued")
 		}
 	} else {
 		rw.clearLastDrift()

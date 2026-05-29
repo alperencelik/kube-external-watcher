@@ -142,8 +142,6 @@ import (
 
     ctrl "sigs.k8s.io/controller-runtime"
     "sigs.k8s.io/controller-runtime/pkg/client"
-    "sigs.k8s.io/controller-runtime/pkg/handler"
-    "sigs.k8s.io/controller-runtime/pkg/source"
 
     myv1 "example.com/database-operator/api/v1"
     "example.com/database-operator/internal/fetcher"
@@ -172,18 +170,22 @@ func main() {
                     ResourceKey:     cr.Status.InstanceID,
                 }
             },
+            // Optional: skip status-only updates and tune readiness retries.
+            watcher.AutoRegisterWithFilter(watcher.EventFilter{
+                Update: func(oldObj, newObj client.Object) bool {
+                    return oldObj.GetGeneration() != newObj.GetGeneration()
+                },
+            }),
+            watcher.AutoRegisterWithReadinessRetry(watcher.ReadinessRetryConfig{
+                InitialInterval: 5 * time.Second,
+            }),
         ),
     )
 
-    // Add watcher to manager (runs as a Runnable, respects leader election).
-    mgr.Add(ew)
-
-    // Wire the watcher's event channel to the controller.
+    // Wire the source to the controller. The watcher enqueues a reconcile.Request on drift.
     ctrl.NewControllerManagedBy(mgr).
         For(&myv1.Database{}).
-        WatchesRawSource(
-            source.Channel(ew.EventChannel(), &handler.EnqueueRequestForObject{}),
-        ).
+        WatchesRawSource(ew).
         Complete(&DatabaseReconciler{Client: mgr.GetClient()})
 
     mgr.Start(ctrl.SetupSignalHandler())
@@ -200,13 +202,10 @@ ew := watcher.NewExternalWatcher(dbFetcher,
     watcher.WithDefaultPollInterval(30*time.Second),
     watcher.WithLogger(ctrl.Log.WithName("external-watcher")),
 )
-mgr.Add(ew)
 
 ctrl.NewControllerManagedBy(mgr).
     For(&myv1.Database{}).
-    WatchesRawSource(
-        source.Channel(ew.EventChannel(), &handler.EnqueueRequestForObject{}),
-    ).
+    WatchesRawSource(ew).
     Complete(&DatabaseReconciler{
         Client:  mgr.GetClient(),
         Watcher: ew,
@@ -262,7 +261,7 @@ func (r *DatabaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 
     // This runs on:
     //   1. CR create/update (standard controller-runtime watch)
-    //   2. External drift detected (watcher's GenericEvent)
+    //   2. External drift detected (watcher enqueues a reconcile.Request)
     //
     // In both cases, fetch the current cloud state and reconcile.
     if db.Status.InstanceID == "" {
@@ -297,14 +296,15 @@ func (r *DatabaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
                                          │  FetchExternal()  │
                                          │  Transform()      │
                                          │  HasDrifted()?    │
-                                         │  ──> yes: event   │
+                                         │  ──> yes: enqueue │
                                          └────────┬──────────┘
                                                   │
-                                          GenericEvent
+                                        reconcile.Request
                                                   │
                                          ┌────────▼─────────┐
                                          │  Controller      │
-                                         │  Reconcile()     │
+                                         │  workqueue       │
+                                         │  → Reconcile()   │
                                          └──────────────────┘
 ```
 
@@ -368,7 +368,7 @@ watcher.NewExternalWatcher(dbFetcher,
 
 ## 6. Emitting Kubernetes Events on drift (optional)
 
-The watcher signals drift through `EventChannel` (which triggers `Reconcile`) and exposes structured details via `ExternalWatcher.LastDrift(key)`. This lets the reconciler emit a Kubernetes Event with timestamp and a diff string, without the library having to take a dependency on `record.EventRecorder` itself.
+The watcher signals drift by enqueueing a `reconcile.Request` directly onto the controller's workqueue (which triggers `Reconcile`) and exposes structured details via `ExternalWatcher.LastDrift(key)`. This lets the reconciler emit a Kubernetes Event with timestamp and a diff string, without the library having to take a dependency on `record.EventRecorder` itself.
 
 To use it, inject the watcher into the reconciler (same shape as the manual-register example) and add an `EventRecorder`:
 
@@ -378,9 +378,7 @@ recorder := mgr.GetEventRecorderFor("database-controller")
 
 ctrl.NewControllerManagedBy(mgr).
     For(&myv1.Database{}).
-    WatchesRawSource(
-        source.Channel(ew.EventChannel(), &handler.EnqueueRequestForObject{}),
-    ).
+    WatchesRawSource(ew).
     Complete(&DatabaseReconciler{
         Client:   mgr.GetClient(),
         Watcher:  ew,

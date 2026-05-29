@@ -10,7 +10,6 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	io_prometheus_client "github.com/prometheus/client_model/go"
 	"k8s.io/apimachinery/pkg/types"
-	"sigs.k8s.io/controller-runtime/pkg/event"
 )
 
 func newTestMetrics(t *testing.T) (*metricsCollector, *prometheus.Registry) {
@@ -105,13 +104,12 @@ func TestNilMetricsCollector_NoPanic(t *testing.T) {
 
 func TestMetrics_PollSuccessIncrementsCounter(t *testing.T) {
 	m, reg := newTestMetrics(t)
-	eventCh := make(chan event.GenericEvent, 10)
 	fetcher := &testFetcher{}
 	fetcher.setDesiredState("state")
 	fetcher.setResourceState("state") // no drift
 	key := types.NamespacedName{Namespace: "default", Name: "test-poll"}
 
-	rw := newResourceWatcher(key, "rk", 1*time.Hour, fetcher, NewDeepEqualComparator(), eventCh, logr.Discard(), m)
+	rw := newResourceWatcher(key, "rk", 1*time.Hour, fetcher, NewDeepEqualComparator(), logr.Discard(), m)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -125,11 +123,10 @@ func TestMetrics_PollSuccessIncrementsCounter(t *testing.T) {
 
 func TestMetrics_PollErrorIncrementsCounter(t *testing.T) {
 	m, reg := newTestMetrics(t)
-	eventCh := make(chan event.GenericEvent, 10)
 	fetcher := &testFetcher{desiredErr: errors.New("fail")}
 	key := types.NamespacedName{Namespace: "default", Name: "test-err"}
 
-	rw := newResourceWatcher(key, "rk", 1*time.Hour, fetcher, NewDeepEqualComparator(), eventCh, logr.Discard(), m)
+	rw := newResourceWatcher(key, "rk", 1*time.Hour, fetcher, NewDeepEqualComparator(), logr.Discard(), m)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -143,12 +140,11 @@ func TestMetrics_PollErrorIncrementsCounter(t *testing.T) {
 
 func TestMetrics_FetchExternalErrorIncrementsCounter(t *testing.T) {
 	m, reg := newTestMetrics(t)
-	eventCh := make(chan event.GenericEvent, 10)
 	fetcher := &testFetcher{resourceErr: errors.New("api fail")}
 	fetcher.setDesiredState("desired")
 	key := types.NamespacedName{Namespace: "default", Name: "test-fetch-err"}
 
-	rw := newResourceWatcher(key, "rk", 1*time.Hour, fetcher, NewDeepEqualComparator(), eventCh, logr.Discard(), m)
+	rw := newResourceWatcher(key, "rk", 1*time.Hour, fetcher, NewDeepEqualComparator(), logr.Discard(), m)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -167,13 +163,12 @@ func TestMetrics_FetchExternalErrorIncrementsCounter(t *testing.T) {
 
 func TestMetrics_FetchDurationRecorded(t *testing.T) {
 	m, reg := newTestMetrics(t)
-	eventCh := make(chan event.GenericEvent, 10)
 	fetcher := &testFetcher{}
 	fetcher.setDesiredState("state")
 	fetcher.setResourceState("state")
 	key := types.NamespacedName{Namespace: "default", Name: "test-duration"}
 
-	rw := newResourceWatcher(key, "rk", 1*time.Hour, fetcher, NewDeepEqualComparator(), eventCh, logr.Discard(), m)
+	rw := newResourceWatcher(key, "rk", 1*time.Hour, fetcher, NewDeepEqualComparator(), logr.Discard(), m)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -187,13 +182,13 @@ func TestMetrics_FetchDurationRecorded(t *testing.T) {
 
 func TestMetrics_DriftDetectedIncrementsCounter(t *testing.T) {
 	m, reg := newTestMetrics(t)
-	eventCh := make(chan event.GenericEvent, 10)
 	fetcher := &testFetcher{}
 	fetcher.setDesiredState("desired")
 	fetcher.setResourceState("different")
 	key := types.NamespacedName{Namespace: "default", Name: "test-drift"}
 
-	rw := newResourceWatcher(key, "rk", 1*time.Hour, fetcher, NewDeepEqualComparator(), eventCh, logr.Discard(), m)
+	rw := newResourceWatcher(key, "rk", 1*time.Hour, fetcher, NewDeepEqualComparator(), logr.Discard(), m)
+	rw.queue = newTestRequestQueue()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

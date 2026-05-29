@@ -10,10 +10,10 @@ Operators managing external resources can't rely on Kubernetes events alone — 
 
 `kube-external-watcher` runs alongside your controllers, polls the external API, and triggers reconciliation **only when drift is detected**:
 
-1. Runs as a `manager.Runnable` (leader-elected, one replica polls).
+1. Implements `source.Source` — wire it into your controller with `WatchesRawSource(ew)`.
 2. Per-resource goroutines.
 3. You implement `ResourceStateFetcher` + optional `StateComparator`.
-4. Drift → `GenericEvent` → reconcile. No drift → nothing.
+4. Drift → `reconcile.Request` on the controller's workqueue → reconcile. No drift → nothing.
 
 ## Getting started
 

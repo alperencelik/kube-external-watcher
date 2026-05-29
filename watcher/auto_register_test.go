@@ -7,12 +7,14 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	toolscache "k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/util/workqueue"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
 type fakeRegistration struct{}
@@ -44,9 +46,11 @@ func (f *fakeCache) GetInformer(_ context.Context, _ client.Object, _ ...cache.I
 
 // helpers
 
-// newTestObj creates an objectReference for use as a simulated informer event.
+// newTestObj creates a corev1.ConfigMap for use as a simulated informer event.
+// ConfigMap is used as a generic, dependency-free client.Object — its shape
+// is irrelevant to the watcher logic.
 func newTestObj(name string) client.Object {
-	return &objectReference{
+	return &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
 			Namespace: "default",
@@ -55,10 +59,10 @@ func newTestObj(name string) client.Object {
 }
 
 // setupTestWatcher creates an ExternalWatcher configured with auto-register
-// and calls setupAutoRegister. Returns the watcher, the fake informer
-// (so tests can fire events), and the event channel. The testFetcher is
-// returned so tests can control readiness via the ready field.
-func setupTestWatcher(t *testing.T, extractor ConfigExtractorFn) (*ExternalWatcher, *fakeInformer, chan event.GenericEvent, *testFetcher) {
+// and calls setupAutoRegister. Returns the watcher, the fake informer (so
+// tests can fire events), the workqueue (for asserting on enqueued
+// reconcile.Requests), and the testFetcher (so tests can control readiness).
+func setupTestWatcher(t *testing.T, extractor ConfigExtractorFn) (*ExternalWatcher, *fakeInformer, workqueue.TypedRateLimitingInterface[reconcile.Request], *testFetcher) {
 	t.Helper()
 	fi := &fakeInformer{}
 	fc := &fakeCache{informer: fi}
@@ -68,15 +72,14 @@ func setupTestWatcher(t *testing.T, extractor ConfigExtractorFn) (*ExternalWatch
 	fetcher.setResourceState("different")
 
 	w := &ExternalWatcher{
-		fetcher:                fetcher,
-		comparator:             NewDeepEqualComparator(),
-		defaultPollInterval:    50 * time.Millisecond,
-		eventChannelBufferSize: 10,
-		logger:                 logr.Discard(),
-		watchers:               make(map[types.NamespacedName]*resourceWatcher),
+		fetcher:             fetcher,
+		comparator:          NewDeepEqualComparator(),
+		defaultPollInterval: 50 * time.Millisecond,
+		logger:              logr.Discard(),
+		watchers:            make(map[types.NamespacedName]*resourceWatcher),
 		autoRegister: &autoRegisterConfig{
 			cache:     fc,
-			obj:       &objectReference{},
+			obj:       &corev1.ConfigMap{},
 			extractor: extractor,
 			retryConfig: ReadinessRetryConfig{
 				InitialInterval: 5 * time.Millisecond,
@@ -86,13 +89,15 @@ func setupTestWatcher(t *testing.T, extractor ConfigExtractorFn) (*ExternalWatch
 			retries: make(map[types.NamespacedName]context.CancelFunc),
 		},
 	}
-	w.eventCh = make(chan event.GenericEvent, w.eventChannelBufferSize)
 
 	if err := setupAutoRegister(context.Background(), w); err != nil {
 		t.Fatalf("setupAutoRegister failed: %v", err)
 	}
 
-	return w, fi, w.eventCh, fetcher
+	q := workqueue.NewTypedRateLimitingQueue(
+		workqueue.DefaultTypedControllerRateLimiter[reconcile.Request](),
+	)
+	return w, fi, q, fetcher
 }
 
 // setupTestWatcherWithFilter is like setupTestWatcher but attaches an EventFilter.
@@ -106,15 +111,14 @@ func setupTestWatcherWithFilter(t *testing.T, extractor ConfigExtractorFn, filte
 	fetcher.setResourceState("different")
 
 	w := &ExternalWatcher{
-		fetcher:                fetcher,
-		comparator:             NewDeepEqualComparator(),
-		defaultPollInterval:    50 * time.Millisecond,
-		eventChannelBufferSize: 10,
-		logger:                 logr.Discard(),
-		watchers:               make(map[types.NamespacedName]*resourceWatcher),
+		fetcher:             fetcher,
+		comparator:          NewDeepEqualComparator(),
+		defaultPollInterval: 50 * time.Millisecond,
+		logger:              logr.Discard(),
+		watchers:            make(map[types.NamespacedName]*resourceWatcher),
 		autoRegister: &autoRegisterConfig{
 			cache:     fc,
-			obj:       &objectReference{},
+			obj:       &corev1.ConfigMap{},
 			extractor: extractor,
 			filter:    &filter,
 			retryConfig: ReadinessRetryConfig{
@@ -125,7 +129,6 @@ func setupTestWatcherWithFilter(t *testing.T, extractor ConfigExtractorFn, filte
 			retries: make(map[types.NamespacedName]context.CancelFunc),
 		},
 	}
-	w.eventCh = make(chan event.GenericEvent, w.eventChannelBufferSize)
 
 	if err := setupAutoRegister(context.Background(), w); err != nil {
 		t.Fatalf("setupAutoRegister failed: %v", err)
@@ -162,30 +165,46 @@ func waitForRetryDone(t *testing.T, w *ExternalWatcher, key types.NamespacedName
 	}
 }
 
-// startTestWatcher marks the watcher as started so Register spawns goroutines.
-func startTestWatcher(t *testing.T, w *ExternalWatcher) context.CancelFunc {
+// startTestWatcher marks the watcher as started with the given queue so
+// Register spawns goroutines that enqueue onto it.
+func startTestWatcher(t *testing.T, w *ExternalWatcher, q workqueue.TypedRateLimitingInterface[reconcile.Request]) context.CancelFunc {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	w.mu.Lock()
 	w.ctx = ctx
+	w.queue = q
 	w.started = true
 	w.mu.Unlock()
 	return cancel
 }
 
+// waitForQueueRequest waits up to 2s for at least one request, returning it
+// (consumed) or failing the test.
+func waitForQueueRequest(t *testing.T, q workqueue.TypedRateLimitingInterface[reconcile.Request]) reconcile.Request {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if q.Len() > 0 {
+			req, _ := q.Get()
+			q.Done(req)
+			q.Forget(req)
+			return req
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("timed out waiting for reconcile request")
+	return reconcile.Request{}
+}
+
 // Tests
 
 func TestAutoRegister_AddEventRegistersResource(t *testing.T) {
-	w, fi, eventCh, _ := setupTestWatcher(t, func(obj client.Object) ResourceConfig {
+	w, fi, q, _ := setupTestWatcher(t, func(obj client.Object) ResourceConfig {
 		return ResourceConfig{ResourceKey: "resource-" + obj.GetName()}
 	})
 
-	ctx, cancel := context.WithCancel(context.Background())
+	cancel := startTestWatcher(t, w, q)
 	defer cancel()
-	w.mu.Lock()
-	w.ctx = ctx
-	w.started = true
-	w.mu.Unlock()
 
 	// Simulate an Add event from the informer.
 	obj := newTestObj("my-resource")
@@ -196,20 +215,16 @@ func TestAutoRegister_AddEventRegistersResource(t *testing.T) {
 		t.Fatal("expected resource to be registered after Add event")
 	}
 
-	// The resource watcher should detect drift and emit an event.
-	select {
-	case evt := <-eventCh:
-		if evt.Object.GetName() != "my-resource" {
-			t.Errorf("expected event for my-resource, got %s", evt.Object.GetName())
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for drift event after auto-register")
+	// The resource watcher should detect drift and enqueue a reconcile request.
+	req := waitForQueueRequest(t, q)
+	if req.NamespacedName != key {
+		t.Errorf("expected request for %v, got %v", key, req.NamespacedName)
 	}
 }
 
 func TestAutoRegister_UpdateEventUpdatesConfig(t *testing.T) {
 	callCount := 0
-	w, fi, _, _ := setupTestWatcher(t, func(obj client.Object) ResourceConfig {
+	w, fi, q, _ := setupTestWatcher(t, func(obj client.Object) ResourceConfig {
 		callCount++
 		return ResourceConfig{
 			PollInterval: time.Duration(callCount) * time.Second,
@@ -217,12 +232,8 @@ func TestAutoRegister_UpdateEventUpdatesConfig(t *testing.T) {
 		}
 	})
 
-	ctx, cancel := context.WithCancel(context.Background())
+	cancel := startTestWatcher(t, w, q)
 	defer cancel()
-	w.mu.Lock()
-	w.ctx = ctx
-	w.started = true
-	w.mu.Unlock()
 
 	obj := newTestObj("updatable")
 
@@ -242,16 +253,12 @@ func TestAutoRegister_UpdateEventUpdatesConfig(t *testing.T) {
 }
 
 func TestAutoRegister_DeleteEventUnregistersResource(t *testing.T) {
-	w, fi, _, _ := setupTestWatcher(t, func(obj client.Object) ResourceConfig {
+	w, fi, q, _ := setupTestWatcher(t, func(obj client.Object) ResourceConfig {
 		return ResourceConfig{ResourceKey: "resource-" + obj.GetName()}
 	})
 
-	ctx, cancel := context.WithCancel(context.Background())
+	cancel := startTestWatcher(t, w, q)
 	defer cancel()
-	w.mu.Lock()
-	w.ctx = ctx
-	w.started = true
-	w.mu.Unlock()
 
 	obj := newTestObj("to-delete")
 
@@ -271,16 +278,12 @@ func TestAutoRegister_DeleteEventUnregistersResource(t *testing.T) {
 }
 
 func TestAutoRegister_DeleteTombstoneHandled(t *testing.T) {
-	w, fi, _, _ := setupTestWatcher(t, func(obj client.Object) ResourceConfig {
+	w, fi, q, _ := setupTestWatcher(t, func(obj client.Object) ResourceConfig {
 		return ResourceConfig{ResourceKey: "resource-" + obj.GetName()}
 	})
 
-	ctx, cancel := context.WithCancel(context.Background())
+	cancel := startTestWatcher(t, w, q)
 	defer cancel()
-	w.mu.Lock()
-	w.ctx = ctx
-	w.started = true
-	w.mu.Unlock()
 
 	obj := newTestObj("tombstone-obj")
 	fi.handler.OnAdd(obj, false)
@@ -306,19 +309,17 @@ func TestAutoRegister_GetInformerError(t *testing.T) {
 	fc := &fakeCache{getErr: errors.New("informer unavailable")}
 
 	w := &ExternalWatcher{
-		fetcher:                &testFetcher{},
-		comparator:             NewDeepEqualComparator(),
-		defaultPollInterval:    50 * time.Millisecond,
-		eventChannelBufferSize: 10,
-		logger:                 logr.Discard(),
-		watchers:               make(map[types.NamespacedName]*resourceWatcher),
+		fetcher:             &testFetcher{},
+		comparator:          NewDeepEqualComparator(),
+		defaultPollInterval: 50 * time.Millisecond,
+		logger:              logr.Discard(),
+		watchers:            make(map[types.NamespacedName]*resourceWatcher),
 		autoRegister: &autoRegisterConfig{
 			cache:     fc,
-			obj:       &objectReference{},
+			obj:       &corev1.ConfigMap{},
 			extractor: func(obj client.Object) ResourceConfig { return ResourceConfig{} },
 		},
 	}
-	w.eventCh = make(chan event.GenericEvent, 10)
 
 	err := setupAutoRegister(context.Background(), w)
 	if err == nil {
@@ -327,7 +328,7 @@ func TestAutoRegister_GetInformerError(t *testing.T) {
 }
 
 func TestAutoRegister_NotReadySkipsRegistration(t *testing.T) {
-	w, fi, _, fetcher := setupTestWatcher(t, func(obj client.Object) ResourceConfig {
+	w, fi, q, fetcher := setupTestWatcher(t, func(obj client.Object) ResourceConfig {
 		return ResourceConfig{ResourceKey: "resource-" + obj.GetName()}
 	})
 
@@ -336,7 +337,7 @@ func TestAutoRegister_NotReadySkipsRegistration(t *testing.T) {
 	fetcher.ready = false
 	fetcher.mu.Unlock()
 
-	cancel := startTestWatcher(t, w)
+	cancel := startTestWatcher(t, w, q)
 	defer cancel()
 
 	obj := newTestObj("not-ready")
@@ -349,7 +350,7 @@ func TestAutoRegister_NotReadySkipsRegistration(t *testing.T) {
 }
 
 func TestAutoRegister_BecomesReadyOnUpdate(t *testing.T) {
-	w, fi, eventCh, fetcher := setupTestWatcher(t, func(obj client.Object) ResourceConfig {
+	w, fi, q, fetcher := setupTestWatcher(t, func(obj client.Object) ResourceConfig {
 		return ResourceConfig{ResourceKey: "resource-" + obj.GetName()}
 	})
 
@@ -358,7 +359,7 @@ func TestAutoRegister_BecomesReadyOnUpdate(t *testing.T) {
 	fetcher.ready = false
 	fetcher.mu.Unlock()
 
-	cancel := startTestWatcher(t, w)
+	cancel := startTestWatcher(t, w, q)
 	defer cancel()
 
 	obj := newTestObj("deferred")
@@ -380,23 +381,19 @@ func TestAutoRegister_BecomesReadyOnUpdate(t *testing.T) {
 		t.Fatal("expected resource to be registered after Update when ready")
 	}
 
-	// Should emit a drift event.
-	select {
-	case evt := <-eventCh:
-		if evt.Object.GetName() != "deferred" {
-			t.Errorf("expected event for deferred, got %s", evt.Object.GetName())
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for drift event")
+	// Should enqueue a reconcile request.
+	req := waitForQueueRequest(t, q)
+	if req.NamespacedName != key {
+		t.Errorf("expected request for %v, got %v", key, req.NamespacedName)
 	}
 }
 
 func TestAutoRegister_UnregistersWhenNoLongerReady(t *testing.T) {
-	w, fi, _, fetcher := setupTestWatcher(t, func(obj client.Object) ResourceConfig {
+	w, fi, q, fetcher := setupTestWatcher(t, func(obj client.Object) ResourceConfig {
 		return ResourceConfig{ResourceKey: "resource-" + obj.GetName()}
 	})
 
-	cancel := startTestWatcher(t, w)
+	cancel := startTestWatcher(t, w, q)
 	defer cancel()
 
 	obj := newTestObj("transient")
@@ -431,7 +428,10 @@ func TestAutoRegister_FilterBlocksAddEvent(t *testing.T) {
 		},
 	)
 
-	cancel := startTestWatcher(t, w)
+	q := workqueue.NewTypedRateLimitingQueue(
+		workqueue.DefaultTypedControllerRateLimiter[reconcile.Request](),
+	)
+	cancel := startTestWatcher(t, w, q)
 	defer cancel()
 
 	// "blocked" should be filtered out.
@@ -460,7 +460,10 @@ func TestAutoRegister_FilterBlocksUpdateEvent(t *testing.T) {
 		},
 	)
 
-	cancel := startTestWatcher(t, w)
+	q := workqueue.NewTypedRateLimitingQueue(
+		workqueue.DefaultTypedControllerRateLimiter[reconcile.Request](),
+	)
+	cancel := startTestWatcher(t, w, q)
 	defer cancel()
 
 	// Add the resource first (no Update filter on Add).
@@ -486,7 +489,7 @@ func TestAutoRegister_FilterBlocksUpdateEvent(t *testing.T) {
 	}
 
 	// Update with new generation — should pass.
-	newGen := &objectReference{
+	newGen := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:       "gen-test",
 			Namespace:  "default",
@@ -511,7 +514,10 @@ func TestAutoRegister_FilterBlocksDeleteEvent(t *testing.T) {
 		},
 	)
 
-	cancel := startTestWatcher(t, w)
+	q := workqueue.NewTypedRateLimitingQueue(
+		workqueue.DefaultTypedControllerRateLimiter[reconcile.Request](),
+	)
+	cancel := startTestWatcher(t, w, q)
 	defer cancel()
 
 	// Register two resources.
@@ -535,11 +541,11 @@ func TestAutoRegister_FilterBlocksDeleteEvent(t *testing.T) {
 
 func TestAutoRegister_NilFilterAllowsAll(t *testing.T) {
 	// setupTestWatcher (without filter) should still work — all events pass.
-	w, fi, _, _ := setupTestWatcher(t, func(obj client.Object) ResourceConfig {
+	w, fi, q, _ := setupTestWatcher(t, func(obj client.Object) ResourceConfig {
 		return ResourceConfig{ResourceKey: "resource-" + obj.GetName()}
 	})
 
-	cancel := startTestWatcher(t, w)
+	cancel := startTestWatcher(t, w, q)
 	defer cancel()
 
 	fi.handler.OnAdd(newTestObj("no-filter"), false)
@@ -551,7 +557,7 @@ func TestAutoRegister_NilFilterAllowsAll(t *testing.T) {
 // Readiness retries
 
 func TestAutoRegister_RetryRegistersWhenReady(t *testing.T) {
-	w, fi, eventCh, fetcher := setupTestWatcher(t, func(obj client.Object) ResourceConfig {
+	w, fi, q, fetcher := setupTestWatcher(t, func(obj client.Object) ResourceConfig {
 		return ResourceConfig{ResourceKey: "resource-" + obj.GetName()}
 	})
 
@@ -559,7 +565,7 @@ func TestAutoRegister_RetryRegistersWhenReady(t *testing.T) {
 	fetcher.ready = false
 	fetcher.mu.Unlock()
 
-	cancel := startTestWatcher(t, w)
+	cancel := startTestWatcher(t, w, q)
 	defer cancel()
 
 	obj := newTestObj("slow-provision")
@@ -579,13 +585,9 @@ func TestAutoRegister_RetryRegistersWhenReady(t *testing.T) {
 	fetcher.ready = true
 	fetcher.mu.Unlock()
 
-	select {
-	case evt := <-eventCh:
-		if evt.Object.GetName() != "slow-provision" {
-			t.Errorf("expected event for slow-provision, got %s", evt.Object.GetName())
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for drift event after retry registration")
+	req := waitForQueueRequest(t, q)
+	if req.NamespacedName != key {
+		t.Errorf("expected request for %v, got %v", key, req.NamespacedName)
 	}
 
 	if !w.IsRegistered(key) {
@@ -594,7 +596,7 @@ func TestAutoRegister_RetryRegistersWhenReady(t *testing.T) {
 }
 
 func TestAutoRegister_RetryNoDuplicateForSameKey(t *testing.T) {
-	w, fi, _, fetcher := setupTestWatcher(t, func(obj client.Object) ResourceConfig {
+	w, fi, q, fetcher := setupTestWatcher(t, func(obj client.Object) ResourceConfig {
 		return ResourceConfig{ResourceKey: "resource-" + obj.GetName()}
 	})
 
@@ -602,7 +604,7 @@ func TestAutoRegister_RetryNoDuplicateForSameKey(t *testing.T) {
 	fetcher.ready = false
 	fetcher.mu.Unlock()
 
-	cancel := startTestWatcher(t, w)
+	cancel := startTestWatcher(t, w, q)
 	defer cancel()
 
 	obj := newTestObj("dup-retry")
@@ -626,7 +628,7 @@ func TestAutoRegister_RetryNoDuplicateForSameKey(t *testing.T) {
 }
 
 func TestAutoRegister_RetryCancelledOnDelete(t *testing.T) {
-	w, fi, _, fetcher := setupTestWatcher(t, func(obj client.Object) ResourceConfig {
+	w, fi, q, fetcher := setupTestWatcher(t, func(obj client.Object) ResourceConfig {
 		return ResourceConfig{ResourceKey: "resource-" + obj.GetName()}
 	})
 
@@ -634,7 +636,7 @@ func TestAutoRegister_RetryCancelledOnDelete(t *testing.T) {
 	fetcher.ready = false
 	fetcher.mu.Unlock()
 
-	cancel := startTestWatcher(t, w)
+	cancel := startTestWatcher(t, w, q)
 	defer cancel()
 
 	obj := newTestObj("delete-during-retry")
@@ -655,7 +657,7 @@ func TestAutoRegister_RetryCancelledOnDelete(t *testing.T) {
 }
 
 func TestAutoRegister_RetryCancelledWhenUpdateMakesReady(t *testing.T) {
-	w, fi, _, fetcher := setupTestWatcher(t, func(obj client.Object) ResourceConfig {
+	w, fi, q, fetcher := setupTestWatcher(t, func(obj client.Object) ResourceConfig {
 		return ResourceConfig{ResourceKey: "resource-" + obj.GetName()}
 	})
 
@@ -663,7 +665,7 @@ func TestAutoRegister_RetryCancelledWhenUpdateMakesReady(t *testing.T) {
 	fetcher.ready = false
 	fetcher.mu.Unlock()
 
-	cancel := startTestWatcher(t, w)
+	cancel := startTestWatcher(t, w, q)
 	defer cancel()
 
 	obj := newTestObj("update-ready")
@@ -701,15 +703,14 @@ func TestAutoRegister_RetryCancelledOnShutdown(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	w := &ExternalWatcher{
-		fetcher:                fetcher,
-		comparator:             NewDeepEqualComparator(),
-		defaultPollInterval:    50 * time.Millisecond,
-		eventChannelBufferSize: 10,
-		logger:                 logr.Discard(),
-		watchers:               make(map[types.NamespacedName]*resourceWatcher),
+		fetcher:             fetcher,
+		comparator:          NewDeepEqualComparator(),
+		defaultPollInterval: 50 * time.Millisecond,
+		logger:              logr.Discard(),
+		watchers:            make(map[types.NamespacedName]*resourceWatcher),
 		autoRegister: &autoRegisterConfig{
 			cache: fc,
-			obj:   &objectReference{},
+			obj:   &corev1.ConfigMap{},
 			extractor: func(obj client.Object) ResourceConfig {
 				return ResourceConfig{ResourceKey: "resource-" + obj.GetName()}
 			},
@@ -721,14 +722,17 @@ func TestAutoRegister_RetryCancelledOnShutdown(t *testing.T) {
 			retries: make(map[types.NamespacedName]context.CancelFunc),
 		},
 	}
-	w.eventCh = make(chan event.GenericEvent, w.eventChannelBufferSize)
 
 	if err := setupAutoRegister(ctx, w); err != nil {
 		t.Fatalf("setupAutoRegister failed: %v", err)
 	}
 
+	q := workqueue.NewTypedRateLimitingQueue(
+		workqueue.DefaultTypedControllerRateLimiter[reconcile.Request](),
+	)
 	w.mu.Lock()
 	w.ctx = ctx
+	w.queue = q
 	w.started = true
 	w.mu.Unlock()
 
@@ -747,7 +751,7 @@ func TestAutoRegister_RetryCancelledOnShutdown(t *testing.T) {
 }
 
 func TestAutoRegister_RetryMaxRetriesGivesUp(t *testing.T) {
-	w, fi, _, fetcher := setupTestWatcher(t, func(obj client.Object) ResourceConfig {
+	w, fi, q, fetcher := setupTestWatcher(t, func(obj client.Object) ResourceConfig {
 		return ResourceConfig{ResourceKey: "resource-" + obj.GetName()}
 	})
 
@@ -758,7 +762,7 @@ func TestAutoRegister_RetryMaxRetriesGivesUp(t *testing.T) {
 	// Set maxRetries to 3.
 	w.autoRegister.retryConfig.MaxRetries = 3
 
-	cancel := startTestWatcher(t, w)
+	cancel := startTestWatcher(t, w, q)
 	defer cancel()
 
 	obj := newTestObj("max-retry")
@@ -776,7 +780,7 @@ func TestAutoRegister_RetryMaxRetriesGivesUp(t *testing.T) {
 }
 
 func TestAutoRegister_RetryOnUpdateNotRegistered(t *testing.T) {
-	w, fi, _, fetcher := setupTestWatcher(t, func(obj client.Object) ResourceConfig {
+	w, fi, q, fetcher := setupTestWatcher(t, func(obj client.Object) ResourceConfig {
 		return ResourceConfig{ResourceKey: "resource-" + obj.GetName()}
 	})
 
@@ -784,7 +788,7 @@ func TestAutoRegister_RetryOnUpdateNotRegistered(t *testing.T) {
 	fetcher.ready = false
 	fetcher.mu.Unlock()
 
-	cancel := startTestWatcher(t, w)
+	cancel := startTestWatcher(t, w, q)
 	defer cancel()
 
 	obj := newTestObj("update-not-registered")
@@ -804,11 +808,11 @@ func TestAutoRegister_RetryOnUpdateNotRegistered(t *testing.T) {
 // Auto-register vs manual register guardrails
 
 func TestAutoRegister_ManualRegisterNoOpWhenAutoRegisterEnabled(t *testing.T) {
-	w, _, _, _ := setupTestWatcher(t, func(obj client.Object) ResourceConfig {
+	w, _, q, _ := setupTestWatcher(t, func(obj client.Object) ResourceConfig {
 		return ResourceConfig{ResourceKey: "resource-" + obj.GetName()}
 	})
 
-	cancel := startTestWatcher(t, w)
+	cancel := startTestWatcher(t, w, q)
 	defer cancel()
 
 	key := types.NamespacedName{Namespace: "default", Name: "manual-register"}
@@ -822,11 +826,11 @@ func TestAutoRegister_ManualRegisterNoOpWhenAutoRegisterEnabled(t *testing.T) {
 }
 
 func TestAutoRegister_ManualUnregisterAllowedWhenAutoRegisterEnabled(t *testing.T) {
-	w, fi, _, _ := setupTestWatcher(t, func(obj client.Object) ResourceConfig {
+	w, fi, q, _ := setupTestWatcher(t, func(obj client.Object) ResourceConfig {
 		return ResourceConfig{ResourceKey: "resource-" + obj.GetName()}
 	})
 
-	cancel := startTestWatcher(t, w)
+	cancel := startTestWatcher(t, w, q)
 	defer cancel()
 
 	// Auto-register a resource via informer Add event.
