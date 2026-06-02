@@ -10,15 +10,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-const (
-	// DefaultPollInterval is the fallback poll interval when neither
-	// the resource config nor the global option specifies one.
-	DefaultPollInterval = 30 * time.Second
-
-	// DefaultEventChannelBufferSize is the buffer size for the
-	// GenericEvent channel used with source.Channel.
-	DefaultEventChannelBufferSize = 1024
-)
+// DefaultPollInterval is the fallback poll interval when neither
+// the resource config nor the global option specifies one.
+const DefaultPollInterval = 30 * time.Second
 
 // Option is a functional option for configuring an ExternalWatcher.
 type Option func(*ExternalWatcher)
@@ -46,13 +40,6 @@ func WithLogger(l logr.Logger) Option {
 	}
 }
 
-// WithEventChannelBufferSize sets the buffer size for the event channel.
-func WithEventChannelBufferSize(size int) Option {
-	return func(w *ExternalWatcher) {
-		w.eventChannelBufferSize = size
-	}
-}
-
 // WithMetrics enables Prometheus metrics, registered against
 // controller-runtime's default metrics registry. The controller name
 // is used as a label to distinguish metrics from different controllers
@@ -74,35 +61,42 @@ func WithMetrics(controllerName string) Option {
 // the resource is unregistered.
 //
 // The cache is typically obtained via mgr.GetCache(). The obj parameter
-// is a prototype of the CR type to watch (e.g. &myv1.Database{}).
-// An optional ReadinessRetryConfig can be passed to control readiness
-// retry behavior. If omitted, defaults apply (10s initial, 10m max,
-// unlimited retries).
-func WithAutoRegister(c cache.Cache, obj client.Object, fn ConfigExtractorFn, retryCfg ...ReadinessRetryConfig) Option {
+// is a prototype of the CR type to watch (e.g. &myv1.Database{}). Pass
+// AutoRegisterOption values (AutoRegisterWithFilter,
+// AutoRegisterWithReadinessRetry) to tune behavior.
+func WithAutoRegister(c cache.Cache, obj client.Object, fn ConfigExtractorFn, opts ...AutoRegisterOption) Option {
 	return func(w *ExternalWatcher) {
-		var cfg ReadinessRetryConfig
-		if len(retryCfg) > 0 {
-			cfg = retryCfg[0]
+		cfg := &autoRegisterConfig{
+			cache:     c,
+			obj:       obj,
+			extractor: fn,
+			retries:   make(map[types.NamespacedName]context.CancelFunc),
 		}
-		w.autoRegister = &autoRegisterConfig{
-			cache:       c,
-			obj:         obj,
-			extractor:   fn,
-			retryConfig: cfg.withDefaults(),
-			retries:     make(map[types.NamespacedName]context.CancelFunc),
+		for _, opt := range opts {
+			opt(cfg)
 		}
+		cfg.retryConfig = cfg.retryConfig.withDefaults()
+		w.autoRegister = cfg
 	}
 }
 
-// WithAutoRegisterFilter sets an EventFilter to control which informer
+// AutoRegisterOption configures auto-register behavior. Pass these to
+// WithAutoRegister to tune filtering and readiness retries.
+type AutoRegisterOption func(*autoRegisterConfig)
+
+// AutoRegisterWithFilter sets an EventFilter to control which informer
 // events are processed by auto-register. Events rejected by the filter
 // are silently skipped — the handler logic does not run for them.
-// Must be used together with WithAutoRegister; has no effect otherwise.
-func WithAutoRegisterFilter(f EventFilter) Option {
-	return func(w *ExternalWatcher) {
-		if w.autoRegister == nil {
-			return
-		}
-		w.autoRegister.filter = &f
+func AutoRegisterWithFilter(f EventFilter) AutoRegisterOption {
+	return func(cfg *autoRegisterConfig) {
+		cfg.filter = &f
+	}
+}
+
+// AutoRegisterWithReadinessRetry overrides the default readiness retry
+// configuration used when IsResourceReadyToWatch returns false
+func AutoRegisterWithReadinessRetry(rc ReadinessRetryConfig) AutoRegisterOption {
+	return func(cfg *autoRegisterConfig) {
+		cfg.retryConfig = rc
 	}
 }

@@ -7,43 +7,55 @@ import (
 	"time"
 
 	"k8s.io/apimachinery/pkg/types"
-	"sigs.k8s.io/controller-runtime/pkg/event"
+	"k8s.io/client-go/util/workqueue"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"github.com/alperencelik/kube-external-watcher/mock"
 	"github.com/alperencelik/kube-external-watcher/watcher"
 )
 
-// waitForEvents waits for one event from ch or fails after a 2s timeout.
-func waitForEvents(t *testing.T, ch <-chan event.GenericEvent) []event.GenericEvent {
+// newTestQueue creates a rate-limiting workqueue suitable for unit tests.
+func newTestQueue() workqueue.TypedRateLimitingInterface[reconcile.Request] {
+	return workqueue.NewTypedRateLimitingQueue(
+		workqueue.DefaultTypedControllerRateLimiter[reconcile.Request](),
+	)
+}
+
+// waitForRequest waits for at least one reconcile.Request to land on the
+// queue or fails after a 2s timeout. Returns the first request and marks
+// it Done so subsequent waits see new items.
+func waitForRequest(t *testing.T, q workqueue.TypedRateLimitingInterface[reconcile.Request]) reconcile.Request {
 	t.Helper()
-	select {
-	case evt := <-ch:
-		return []event.GenericEvent{evt}
-	case <-time.After(2 * time.Second):
-		t.Fatalf("timed out waiting for event")
-	}
-	return nil
-}
-
-// drainEvents returns all events available within the given window.
-func drainEvents(ch <-chan event.GenericEvent, window time.Duration) []event.GenericEvent {
-	var events []event.GenericEvent
-	deadline := time.After(window)
-	for {
-		select {
-		case evt := <-ch:
-			events = append(events, evt)
-		case <-deadline:
-			return events
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if q.Len() > 0 {
+			req, _ := q.Get()
+			q.Done(req)
+			q.Forget(req)
+			return req
 		}
+		time.Sleep(5 * time.Millisecond)
 	}
+	t.Fatalf("timed out waiting for reconcile request")
+	return reconcile.Request{}
 }
 
-func eventKey(evt event.GenericEvent) types.NamespacedName {
-	return types.NamespacedName{
-		Name:      evt.Object.GetName(),
-		Namespace: evt.Object.GetNamespace(),
+// drainRequests pops all requests from the queue that arrive within the
+// given window. Returns them in arrival order.
+func drainRequests(q workqueue.TypedRateLimitingInterface[reconcile.Request], window time.Duration) []reconcile.Request {
+	var reqs []reconcile.Request
+	deadline := time.Now().Add(window)
+	for time.Now().Before(deadline) {
+		if q.Len() > 0 {
+			req, _ := q.Get()
+			q.Done(req)
+			q.Forget(req)
+			reqs = append(reqs, req)
+			continue
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
+	return reqs
 }
 
 func TestExternalWatcher_RegisterBeforeStart(t *testing.T) {
@@ -55,21 +67,21 @@ func TestExternalWatcher_RegisterBeforeStart(t *testing.T) {
 
 	ew := watcher.NewExternalWatcher(fetcher,
 		watcher.WithDefaultPollInterval(50*time.Millisecond),
-		watcher.WithEventChannelBufferSize(10),
 	)
-	ch := ew.EventChannel()
 
 	// Register before Start.
 	ew.Register(key, watcher.ResourceConfig{ResourceKey: resourceKey})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go func() { _ = ew.Start(ctx) }()
+	q := newTestQueue()
+	if err := ew.Start(ctx, q); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
 
-	// The pre-registered watcher should detect drift on start.
-	events := waitForEvents(t, ch)
-	if eventKey(events[0]) != key {
-		t.Errorf("expected event for %v, got %v", key, eventKey(events[0]))
+	req := waitForRequest(t, q)
+	if req.NamespacedName != key {
+		t.Errorf("expected request for %v, got %v", key, req.NamespacedName)
 	}
 }
 
@@ -82,21 +94,19 @@ func TestExternalWatcher_RegisterAfterStart(t *testing.T) {
 
 	ew := watcher.NewExternalWatcher(fetcher,
 		watcher.WithDefaultPollInterval(50*time.Millisecond),
-		watcher.WithEventChannelBufferSize(10),
 	)
-	ch := ew.EventChannel()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go func() { _ = ew.Start(ctx) }()
-
-	// Brief wait for Start to execute.
-	time.Sleep(50 * time.Millisecond)
+	q := newTestQueue()
+	if err := ew.Start(ctx, q); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
 
 	// Register after Start.
 	ew.Register(key, watcher.ResourceConfig{ResourceKey: resourceKey})
 
-	waitForEvents(t, ch)
+	waitForRequest(t, q)
 }
 
 func TestExternalWatcher_Unregister(t *testing.T) {
@@ -108,18 +118,19 @@ func TestExternalWatcher_Unregister(t *testing.T) {
 
 	ew := watcher.NewExternalWatcher(fetcher,
 		watcher.WithDefaultPollInterval(50*time.Millisecond),
-		watcher.WithEventChannelBufferSize(10),
 	)
-	ch := ew.EventChannel()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go func() { _ = ew.Start(ctx) }()
+	q := newTestQueue()
+	if err := ew.Start(ctx, q); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
 
 	ew.Register(key, watcher.ResourceConfig{ResourceKey: resourceKey})
 
 	// Wait for initial drift event.
-	waitForEvents(t, ch)
+	waitForRequest(t, q)
 
 	// Unregister and verify no more events.
 	ew.Unregister(key)
@@ -129,9 +140,9 @@ func TestExternalWatcher_Unregister(t *testing.T) {
 	}
 
 	fetcher.SetResourceState(resourceKey, "changed-after-unregister")
-	extra := drainEvents(ch, 200*time.Millisecond)
+	extra := drainRequests(q, 200*time.Millisecond)
 	if len(extra) != 0 {
-		t.Errorf("expected no new events after unregister, got %d", len(extra))
+		t.Errorf("expected no new requests after unregister, got %d", len(extra))
 	}
 }
 
@@ -167,12 +178,18 @@ func TestExternalWatcher_IsRegistered(t *testing.T) {
 	}
 }
 
-func TestExternalWatcher_NeedLeaderElection(t *testing.T) {
+func TestExternalWatcher_StartTwiceReturnsError(t *testing.T) {
 	fetcher := mock.NewFakeResourceStateFetcher()
 	ew := watcher.NewExternalWatcher(fetcher)
 
-	if !ew.NeedLeaderElection() {
-		t.Error("expected NeedLeaderElection to return true")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := ew.Start(ctx, newTestQueue()); err != nil {
+		t.Fatalf("first Start should succeed, got %v", err)
+	}
+	if err := ew.Start(ctx, newTestQueue()); err == nil {
+		t.Fatal("expected second Start to return an error")
 	}
 }
 
@@ -185,13 +202,14 @@ func TestExternalWatcher_PerResourcePollInterval(t *testing.T) {
 
 	ew := watcher.NewExternalWatcher(fetcher,
 		watcher.WithDefaultPollInterval(1*time.Hour),
-		watcher.WithEventChannelBufferSize(10),
 	)
-	ch := ew.EventChannel()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go func() { _ = ew.Start(ctx) }()
+	q := newTestQueue()
+	if err := ew.Start(ctx, q); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
 
 	// Register with a short per-resource interval (overriding the 1h default).
 	ew.Register(key, watcher.ResourceConfig{
@@ -200,7 +218,7 @@ func TestExternalWatcher_PerResourcePollInterval(t *testing.T) {
 	})
 
 	// Should get drift event quickly.
-	waitForEvents(t, ch)
+	waitForRequest(t, q)
 
 	// Fix cloud state to match K8s, then break it again.
 	fetcher.SetResourceState(resourceKey, "desired")
@@ -208,7 +226,7 @@ func TestExternalWatcher_PerResourcePollInterval(t *testing.T) {
 
 	fetcher.SetResourceState(resourceKey, "changed-again")
 
-	waitForEvents(t, ch)
+	waitForRequest(t, q)
 }
 
 func TestExternalWatcher_ReRegisterUpdatesConfig(t *testing.T) {
@@ -220,17 +238,18 @@ func TestExternalWatcher_ReRegisterUpdatesConfig(t *testing.T) {
 
 	ew := watcher.NewExternalWatcher(fetcher,
 		watcher.WithDefaultPollInterval(50*time.Millisecond),
-		watcher.WithEventChannelBufferSize(10),
 	)
-	ch := ew.EventChannel()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go func() { _ = ew.Start(ctx) }()
+	q := newTestQueue()
+	if err := ew.Start(ctx, q); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
 
 	// Register, wait for initial drift event.
 	ew.Register(key, watcher.ResourceConfig{ResourceKey: resourceKey})
-	waitForEvents(t, ch)
+	waitForRequest(t, q)
 
 	// Re-register (update config) — should not panic or duplicate.
 	ew.Register(key, watcher.ResourceConfig{
@@ -247,13 +266,14 @@ func TestExternalWatcher_ConcurrentRegisterUnregister(t *testing.T) {
 	fetcher := mock.NewFakeResourceStateFetcher()
 	ew := watcher.NewExternalWatcher(fetcher,
 		watcher.WithDefaultPollInterval(50*time.Millisecond),
-		watcher.WithEventChannelBufferSize(100),
 	)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go func() { _ = ew.Start(ctx) }()
-	time.Sleep(50 * time.Millisecond)
+	q := newTestQueue()
+	if err := ew.Start(ctx, q); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
 
 	var wg sync.WaitGroup
 	for i := 0; i < 50; i++ {
@@ -281,35 +301,29 @@ func TestExternalWatcher_GracefulShutdown(t *testing.T) {
 
 	ew := watcher.NewExternalWatcher(fetcher,
 		watcher.WithDefaultPollInterval(50*time.Millisecond),
-		watcher.WithEventChannelBufferSize(10),
 	)
-	ch := ew.EventChannel()
 
 	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() {
-		done <- ew.Start(ctx)
-	}()
+	q := newTestQueue()
+	if err := ew.Start(ctx, q); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
 
 	ew.Register(key, watcher.ResourceConfig{ResourceKey: resourceKey})
-	waitForEvents(t, ch)
+	waitForRequest(t, q)
 
-	// Cancel context — Start should return promptly.
+	// Cancel context — watcher should clean up running resource watchers.
 	cancel()
 
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Errorf("expected nil error from Start, got %v", err)
+	// Give shutdown a moment to run.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if !ew.IsRegistered(key) {
+			return
 		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("Start did not return after context cancellation")
+		time.Sleep(20 * time.Millisecond)
 	}
-
-	// After shutdown, resource should be cleaned up.
-	if ew.IsRegistered(key) {
-		t.Error("expected resource unregistered after shutdown")
-	}
+	t.Error("expected resource unregistered after shutdown")
 }
 
 func TestExternalWatcher_EndToEnd(t *testing.T) {
@@ -323,43 +337,44 @@ func TestExternalWatcher_EndToEnd(t *testing.T) {
 
 	ew := watcher.NewExternalWatcher(fetcher,
 		watcher.WithDefaultPollInterval(50*time.Millisecond),
-		watcher.WithEventChannelBufferSize(10),
 	)
-	ch := ew.EventChannel()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go func() { _ = ew.Start(ctx) }()
+	q := newTestQueue()
+	if err := ew.Start(ctx, q); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
 
 	// 1. Register resource.
 	ew.Register(key, watcher.ResourceConfig{ResourceKey: resourceKey})
 
 	// 2. Wait for initial drift event (kube says "running", cloud says "stopped").
-	events := waitForEvents(t, ch)
-	if eventKey(events[0]) != key {
-		t.Errorf("expected event for %v, got %v", key, eventKey(events[0]))
+	req := waitForRequest(t, q)
+	if req.NamespacedName != key {
+		t.Errorf("expected request for %v, got %v", key, req.NamespacedName)
 	}
 
 	// 3. Fix cloud state to match K8s — no more drift.
 	fetcher.SetResourceState(resourceKey, kubeState)
-	extra := drainEvents(ch, 200*time.Millisecond)
+	extra := drainRequests(q, 200*time.Millisecond)
 	if len(extra) != 0 {
-		t.Errorf("expected no new events after cloud synced with K8s, got %d", len(extra))
+		t.Errorf("expected no new requests after cloud synced with K8s, got %d", len(extra))
 	}
 
 	// 4. Introduce new drift — cloud state changes.
 	fetcher.SetResourceState(resourceKey, map[string]string{"status": "terminated", "version": "14.2"})
-	events = waitForEvents(t, ch)
-	if eventKey(events[0]) != key {
-		t.Errorf("expected event for %v, got %v", key, eventKey(events[0]))
+	req = waitForRequest(t, q)
+	if req.NamespacedName != key {
+		t.Errorf("expected request for %v, got %v", key, req.NamespacedName)
 	}
 
 	// 5. Unregister and verify cleanup.
 	ew.Unregister(key)
 	fetcher.SetResourceState(resourceKey, map[string]string{"status": "deleted", "version": "14.2"})
-	extra = drainEvents(ch, 200*time.Millisecond)
+	extra = drainRequests(q, 200*time.Millisecond)
 	if len(extra) != 0 {
-		t.Errorf("expected no events after unregister, got %d", len(extra))
+		t.Errorf("expected no requests after unregister, got %d", len(extra))
 	}
 }
 
@@ -372,13 +387,14 @@ func TestExternalWatcher_LastDriftLookup(t *testing.T) {
 
 	ew := watcher.NewExternalWatcher(fetcher,
 		watcher.WithDefaultPollInterval(30*time.Millisecond),
-		watcher.WithEventChannelBufferSize(10),
 	)
-	ch := ew.EventChannel()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go func() { _ = ew.Start(ctx) }()
+	q := newTestQueue()
+	if err := ew.Start(ctx, q); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
 
 	// Unknown key returns false.
 	if _, ok := ew.LastDrift(types.NamespacedName{Name: "missing"}); ok {
@@ -386,7 +402,7 @@ func TestExternalWatcher_LastDriftLookup(t *testing.T) {
 	}
 
 	ew.Register(key, watcher.ResourceConfig{ResourceKey: resourceKey})
-	waitForEvents(t, ch)
+	waitForRequest(t, q)
 
 	// Reconciler-style lookup: a drift was just observed.
 	info, ok := ew.LastDrift(key)
@@ -410,16 +426,17 @@ func TestExternalWatcher_LastDriftAutoClearedOnCleanPoll(t *testing.T) {
 
 	ew := watcher.NewExternalWatcher(fetcher,
 		watcher.WithDefaultPollInterval(30*time.Millisecond),
-		watcher.WithEventChannelBufferSize(10),
 	)
-	ch := ew.EventChannel()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go func() { _ = ew.Start(ctx) }()
+	q := newTestQueue()
+	if err := ew.Start(ctx, q); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
 
 	ew.Register(key, watcher.ResourceConfig{ResourceKey: resourceKey})
-	waitForEvents(t, ch)
+	waitForRequest(t, q)
 
 	if _, ok := ew.LastDrift(key); !ok {
 		t.Fatal("expected drift recorded after first drifted poll")
