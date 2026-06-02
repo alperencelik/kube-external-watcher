@@ -12,7 +12,7 @@ Operators managing external resources can't rely on Kubernetes events alone — 
 
 1. Implements `source.Source` — wire it into your controller with `WatchesRawSource(ew)`.
 2. Per-resource goroutines.
-3. You implement `ResourceStateFetcher` + optional `StateComparator`.
+3. You implement `ResourceStateFetcher` + optional `StateComparator`(defaults to deepEqual comparison).
 4. Drift → `reconcile.Request` on the controller's workqueue → reconcile. No drift → nothing.
 
 ## Getting started
