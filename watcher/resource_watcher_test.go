@@ -114,7 +114,7 @@ func TestResourceWatcher_DriftDetectedOnFirstPoll(t *testing.T) {
 	fetcher.setResourceState("actual")
 	key := types.NamespacedName{Namespace: "default", Name: "test"}
 
-	rw := newResourceWatcher(key, "resource-key-1", 1*time.Hour, fetcher, NewDeepEqualComparator(), logr.Discard(), nil)
+	rw := newResourceWatcher(key, "resource-key-1", 1*time.Hour, 0, fetcher, NewDeepEqualComparator(), logr.Discard(), nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	rw.start(ctx, q)
@@ -137,7 +137,7 @@ func TestResourceWatcher_NoDriftNoEvent(t *testing.T) {
 	fetcher.setResourceState("same")
 	key := types.NamespacedName{Namespace: "default", Name: "test"}
 
-	rw := newResourceWatcher(key, "resource-key-1", 50*time.Millisecond, fetcher, NewDeepEqualComparator(), logr.Discard(), nil)
+	rw := newResourceWatcher(key, "resource-key-1", 50*time.Millisecond, 0, fetcher, NewDeepEqualComparator(), logr.Discard(), nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	rw.start(ctx, q)
@@ -159,7 +159,7 @@ func TestResourceWatcher_DriftTriggersEvent(t *testing.T) {
 	fetcher.setResourceState("v1") // Initially in sync.
 	key := types.NamespacedName{Namespace: "ns", Name: "db"}
 
-	rw := newResourceWatcher(key, "resource-key-1", 50*time.Millisecond, fetcher, NewDeepEqualComparator(), logr.Discard(), nil)
+	rw := newResourceWatcher(key, "resource-key-1", 50*time.Millisecond, 0, fetcher, NewDeepEqualComparator(), logr.Discard(), nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	rw.start(ctx, q)
@@ -186,7 +186,7 @@ func TestResourceWatcher_DesiredStateFetchErrorContinues(t *testing.T) {
 	fetcher := &testFetcher{desiredErr: errors.New("kube api unavailable")}
 	key := types.NamespacedName{Namespace: "default", Name: "test"}
 
-	rw := newResourceWatcher(key, "resource-key-1", 50*time.Millisecond, fetcher, NewDeepEqualComparator(), logr.Discard(), nil)
+	rw := newResourceWatcher(key, "resource-key-1", 50*time.Millisecond, 0, fetcher, NewDeepEqualComparator(), logr.Discard(), nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	rw.start(ctx, q)
@@ -215,7 +215,7 @@ func TestResourceWatcher_CloudFetchErrorContinues(t *testing.T) {
 	fetcher.setDesiredState("desired")
 	key := types.NamespacedName{Namespace: "default", Name: "test"}
 
-	rw := newResourceWatcher(key, "resource-key-1", 50*time.Millisecond, fetcher, NewDeepEqualComparator(), logr.Discard(), nil)
+	rw := newResourceWatcher(key, "resource-key-1", 50*time.Millisecond, 0, fetcher, NewDeepEqualComparator(), logr.Discard(), nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	rw.start(ctx, q)
@@ -243,7 +243,7 @@ func TestResourceWatcher_ContextCancellation(t *testing.T) {
 	fetcher.setResourceState("different")
 	key := types.NamespacedName{Namespace: "default", Name: "test"}
 
-	rw := newResourceWatcher(key, "resource-key-1", 1*time.Hour, fetcher, NewDeepEqualComparator(), logr.Discard(), nil)
+	rw := newResourceWatcher(key, "resource-key-1", 1*time.Hour, 0, fetcher, NewDeepEqualComparator(), logr.Discard(), nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	rw.start(ctx, q)
@@ -272,7 +272,7 @@ func TestResourceWatcher_PollIntervalUpdate(t *testing.T) {
 	fetcher.setResourceState("v1")
 	key := types.NamespacedName{Namespace: "default", Name: "test"}
 
-	rw := newResourceWatcher(key, "resource-key-1", 1*time.Hour, fetcher, NewDeepEqualComparator(), logr.Discard(), nil)
+	rw := newResourceWatcher(key, "resource-key-1", 1*time.Hour, 0, fetcher, NewDeepEqualComparator(), logr.Discard(), nil)
 
 	if got := rw.currentPollInterval(); got != 1*time.Hour {
 		t.Errorf("expected initial poll interval 1h, got %v", got)
@@ -310,7 +310,7 @@ func TestResourceWatcher_TransformAppliedBeforeComparison(t *testing.T) {
 	}
 	key := types.NamespacedName{Namespace: "default", Name: "test"}
 
-	rw := newResourceWatcher(key, "resource-key-1", 50*time.Millisecond, fetcher, NewDeepEqualComparator(), logr.Discard(), nil)
+	rw := newResourceWatcher(key, "resource-key-1", 50*time.Millisecond, 0, fetcher, NewDeepEqualComparator(), logr.Discard(), nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	rw.start(ctx, q)
@@ -347,7 +347,7 @@ func TestResourceWatcher_TransformErrorContinues(t *testing.T) {
 	fetcher.setResourceState("raw-cloud")
 	key := types.NamespacedName{Namespace: "default", Name: "test"}
 
-	rw := newResourceWatcher(key, "resource-key-1", 50*time.Millisecond, fetcher, NewDeepEqualComparator(), logr.Discard(), nil)
+	rw := newResourceWatcher(key, "resource-key-1", 50*time.Millisecond, 0, fetcher, NewDeepEqualComparator(), logr.Discard(), nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	rw.start(ctx, q)
@@ -409,7 +409,7 @@ func TestResourceWatcher_TransformWithCmpOptions(t *testing.T) {
 		cmpopts.SortSlices(func(a, b string) bool { return a < b }),
 	)
 
-	rw := newResourceWatcher(key, "resource-key-1", 50*time.Millisecond, fetcher, comparator, logr.Discard(), nil)
+	rw := newResourceWatcher(key, "resource-key-1", 50*time.Millisecond, 0, fetcher, comparator, logr.Discard(), nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	rw.start(ctx, q)
@@ -431,7 +431,7 @@ func TestResourceWatcher_StatusUpdaterCalledOnEveryPoll(t *testing.T) {
 	fetcher.setResourceState("same") // no drift
 	key := types.NamespacedName{Namespace: "default", Name: "test-status"}
 
-	rw := newResourceWatcher(key, "rk", 50*time.Millisecond, fetcher, NewDeepEqualComparator(), logr.Discard(), nil)
+	rw := newResourceWatcher(key, "rk", 50*time.Millisecond, 0, fetcher, NewDeepEqualComparator(), logr.Discard(), nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	rw.start(ctx, q)
@@ -459,7 +459,7 @@ func TestResourceWatcher_StatusUpdaterReceivesRawState(t *testing.T) {
 	}
 	key := types.NamespacedName{Namespace: "default", Name: "test-raw"}
 
-	rw := newResourceWatcher(key, "rk", 1*time.Hour, fetcher, NewDeepEqualComparator(), logr.Discard(), nil)
+	rw := newResourceWatcher(key, "rk", 1*time.Hour, 0, fetcher, NewDeepEqualComparator(), logr.Discard(), nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -477,7 +477,7 @@ func TestResourceWatcher_StatusUpdaterErrorDoesNotBlockPoll(t *testing.T) {
 	fetcher.setResourceState("different") // drift exists
 	key := types.NamespacedName{Namespace: "default", Name: "test-status-err"}
 
-	rw := newResourceWatcher(key, "rk", 1*time.Hour, fetcher, NewDeepEqualComparator(), logr.Discard(), nil)
+	rw := newResourceWatcher(key, "rk", 1*time.Hour, 0, fetcher, NewDeepEqualComparator(), logr.Discard(), nil)
 	rw.queue = q
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -505,7 +505,7 @@ func TestResourceWatcher_LastDriftPopulatedAndCleared(t *testing.T) {
 	fetcher.setResourceState("stopped")
 	key := types.NamespacedName{Namespace: "ns", Name: "db"}
 
-	rw := newResourceWatcher(key, "rk", 1*time.Hour, fetcher, NewDeepEqualComparator(), logr.Discard(), nil)
+	rw := newResourceWatcher(key, "rk", 1*time.Hour, 0, fetcher, NewDeepEqualComparator(), logr.Discard(), nil)
 	rw.queue = q
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -552,7 +552,7 @@ func TestResourceWatcher_WithoutStatusUpdaterStillWorks(t *testing.T) {
 	fetcher.setResourceState("different")
 	key := types.NamespacedName{Namespace: "default", Name: "test-no-updater"}
 
-	rw := newResourceWatcher(key, "rk", 1*time.Hour, fetcher, NewDeepEqualComparator(), logr.Discard(), nil)
+	rw := newResourceWatcher(key, "rk", 1*time.Hour, 0, fetcher, NewDeepEqualComparator(), logr.Discard(), nil)
 	rw.queue = q
 
 	ctx, cancel := context.WithCancel(context.Background())

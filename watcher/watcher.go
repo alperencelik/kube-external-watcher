@@ -28,6 +28,7 @@ type ExternalWatcher struct {
 	comparator StateComparator
 
 	defaultPollInterval time.Duration
+	pollJitter          float64
 	logger              logr.Logger
 	metrics             *metricsCollector
 
@@ -59,6 +60,7 @@ func NewExternalWatcher(fetcher ResourceStateFetcher, opts ...Option) *ExternalW
 		fetcher:             fetcher,
 		comparator:          NewDeepEqualComparator(),
 		defaultPollInterval: DefaultPollInterval,
+		pollJitter:          DefaultPollJitter,
 		logger:              logr.Discard(),
 		watchers:            make(map[types.NamespacedName]*resourceWatcher),
 	}
@@ -161,8 +163,8 @@ func (w *ExternalWatcher) doRegister(key types.NamespacedName, config ResourceCo
 		return
 	}
 
-	rw := newResourceWatcher(key, config.ResourceKey, pollInterval, w.fetcher,
-		w.comparator, w.logger.WithValues("resource", key.String()),
+	rw := newResourceWatcher(key, config.ResourceKey, pollInterval, w.pollJitter,
+		w.fetcher, w.comparator, w.logger.WithValues("resource", key.String()),
 		w.metrics)
 
 	w.watchers[key] = rw

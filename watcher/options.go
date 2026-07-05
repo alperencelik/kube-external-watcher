@@ -14,6 +14,13 @@ import (
 // the resource config nor the global option specifies one.
 const DefaultPollInterval = 30 * time.Second
 
+// DefaultPollJitter is the default jitter factor applied to poll
+// intervals. Each sleep is stretched by a random amount in
+// [0, factor*interval), so watchers registered at the same time
+// (e.g. during startup cache sync) drift apart instead of hitting
+// the external API in synchronized bursts.
+const DefaultPollJitter = 0.1
+
 // Option is a functional option for configuring an ExternalWatcher.
 type Option func(*ExternalWatcher)
 
@@ -22,6 +29,19 @@ type Option func(*ExternalWatcher)
 func WithDefaultPollInterval(d time.Duration) Option {
 	return func(w *ExternalWatcher) {
 		w.defaultPollInterval = d
+	}
+}
+
+// WithPollJitter sets the jitter factor applied to every poll sleep.
+// The effective sleep is a random duration in
+// [interval, interval+factor*interval). Defaults to DefaultPollJitter;
+// pass 0 to disable jitter and poll on exact intervals.
+func WithPollJitter(factor float64) Option {
+	return func(w *ExternalWatcher) {
+		if factor < 0 {
+			factor = 0
+		}
+		w.pollJitter = factor
 	}
 }
 

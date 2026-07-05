@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/wait"
 	toolscache "k8s.io/client-go/tools/cache"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -41,7 +42,8 @@ type EventFilter struct {
 // ReadinessRetryConfig holds parameters for the readiness retry loop
 // that re-checks IsResourceReadyToWatch with exponential backoff when
 // a resource is not ready during auto-registration. Zero values use
-// defaults (InitialInterval: 10s, MaxInterval: 10m, MaxRetries: 0/unlimited).
+// defaults (InitialInterval: 10s, MaxInterval: 10m, MaxRetries: 0/unlimited,
+// Jitter: 0.1).
 type ReadinessRetryConfig struct {
 	// InitialInterval is the delay before the first retry. Default: 10s.
 	InitialInterval time.Duration
@@ -52,7 +54,14 @@ type ReadinessRetryConfig struct {
 	// MaxRetries is the maximum number of retry attempts. 0 = unlimited
 	// (stopped by context cancellation or resource deletion). Default: 0.
 	MaxRetries int
+
+	// Jitter is the jitter factor applied to each retry sleep: the
+	// effective delay is a random duration in
+	// [interval, interval+Jitter*interval).
+	Jitter *float64
 }
+
+const DefaultReadinessRetryJitter = 0.1
 
 func (c ReadinessRetryConfig) withDefaults() ReadinessRetryConfig {
 	if c.InitialInterval <= 0 {
@@ -60,6 +69,10 @@ func (c ReadinessRetryConfig) withDefaults() ReadinessRetryConfig {
 	}
 	if c.MaxInterval <= 0 {
 		c.MaxInterval = 10 * time.Minute
+	}
+	if c.Jitter == nil || *c.Jitter < 0 {
+		jitter := DefaultReadinessRetryJitter
+		c.Jitter = &jitter
 	}
 	return c
 }
@@ -190,11 +203,21 @@ func (w *ExternalWatcher) startReadinessRetry(ctx context.Context, key types.Nam
 		interval := cfg.InitialInterval
 		attempts := 0
 		for {
+			delay := interval
+			jitter := DefaultReadinessRetryJitter
+			if cfg.Jitter != nil {
+				jitter = *cfg.Jitter
+			}
+			if jitter > 0 {
+				// wait.Jitter treats a non-positive factor as 1.0, so only
+				// call it when jitter is actually enabled.
+				delay = wait.Jitter(interval, jitter)
+			}
 			select {
 			case <-retryCtx.Done():
 				w.logger.V(2).Info("auto-register: readiness retry cancelled", "resource", key.String())
 				return
-			case <-time.After(interval):
+			case <-time.After(delay):
 			}
 
 			attempts++
