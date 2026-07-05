@@ -37,7 +37,7 @@ The informer event handler is set up in `Start()` via `cache.GetInformer()`. Thi
 One goroutine per registered resource:
 
 1. Initial poll on start.
-2. Loop: wait `pollInterval` → `GetDesiredState` → `FetchExternalResource` → `TransformExternalState` → `HasDrifted(desired, transformed)` → enqueue `reconcile.Request` on the controller's workqueue if drifted.
+2. Loop: wait `pollInterval` (stretched by a random jitter of up to `WithPollJitter` factor) → `GetDesiredState` → `FetchExternalResource` → `TransformExternalState` → `HasDrifted(desired, transformed)` → enqueue `reconcile.Request` on the controller's workqueue if drifted.
 3. Fetch/transform/compare errors logged, do not trigger reconciliation, loop continues.
 
 ### Event Bridge

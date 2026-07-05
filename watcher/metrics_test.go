@@ -109,7 +109,7 @@ func TestMetrics_PollSuccessIncrementsCounter(t *testing.T) {
 	fetcher.setResourceState("state") // no drift
 	key := types.NamespacedName{Namespace: "default", Name: "test-poll"}
 
-	rw := newResourceWatcher(key, "rk", 1*time.Hour, fetcher, NewDeepEqualComparator(), logr.Discard(), m)
+	rw := newResourceWatcher(key, "rk", 1*time.Hour, 0, fetcher, NewDeepEqualComparator(), logr.Discard(), m)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -126,7 +126,7 @@ func TestMetrics_PollErrorIncrementsCounter(t *testing.T) {
 	fetcher := &testFetcher{desiredErr: errors.New("fail")}
 	key := types.NamespacedName{Namespace: "default", Name: "test-err"}
 
-	rw := newResourceWatcher(key, "rk", 1*time.Hour, fetcher, NewDeepEqualComparator(), logr.Discard(), m)
+	rw := newResourceWatcher(key, "rk", 1*time.Hour, 0, fetcher, NewDeepEqualComparator(), logr.Discard(), m)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -144,7 +144,7 @@ func TestMetrics_FetchExternalErrorIncrementsCounter(t *testing.T) {
 	fetcher.setDesiredState("desired")
 	key := types.NamespacedName{Namespace: "default", Name: "test-fetch-err"}
 
-	rw := newResourceWatcher(key, "rk", 1*time.Hour, fetcher, NewDeepEqualComparator(), logr.Discard(), m)
+	rw := newResourceWatcher(key, "rk", 1*time.Hour, 0, fetcher, NewDeepEqualComparator(), logr.Discard(), m)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -168,7 +168,7 @@ func TestMetrics_FetchDurationRecorded(t *testing.T) {
 	fetcher.setResourceState("state")
 	key := types.NamespacedName{Namespace: "default", Name: "test-duration"}
 
-	rw := newResourceWatcher(key, "rk", 1*time.Hour, fetcher, NewDeepEqualComparator(), logr.Discard(), m)
+	rw := newResourceWatcher(key, "rk", 1*time.Hour, 0, fetcher, NewDeepEqualComparator(), logr.Discard(), m)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -187,7 +187,7 @@ func TestMetrics_DriftDetectedIncrementsCounter(t *testing.T) {
 	fetcher.setResourceState("different")
 	key := types.NamespacedName{Namespace: "default", Name: "test-drift"}
 
-	rw := newResourceWatcher(key, "rk", 1*time.Hour, fetcher, NewDeepEqualComparator(), logr.Discard(), m)
+	rw := newResourceWatcher(key, "rk", 1*time.Hour, 0, fetcher, NewDeepEqualComparator(), logr.Discard(), m)
 	rw.queue = newTestRequestQueue()
 
 	ctx, cancel := context.WithCancel(context.Background())

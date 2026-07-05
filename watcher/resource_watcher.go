@@ -7,6 +7,7 @@ import (
 
 	"github.com/go-logr/logr"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/util/workqueue"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
@@ -37,6 +38,10 @@ type resourceWatcher struct {
 	mu           sync.Mutex
 	pollInterval time.Duration
 
+	// jitter is the poll jitter factor. Each sleep is stretched by a
+	// random amount in [0, jitter*interval).
+	jitter float64
+
 	// driftMu protects lastDrift. It is separate from mu so that callers
 	// of LastDrift do not contend with poll-interval updates.
 	driftMu   sync.RWMutex
@@ -47,6 +52,7 @@ func newResourceWatcher(
 	key types.NamespacedName,
 	resourceKey any,
 	pollInterval time.Duration,
+	jitter float64,
 	fetcher ResourceStateFetcher,
 	comparator StateComparator,
 	logger logr.Logger,
@@ -56,6 +62,7 @@ func newResourceWatcher(
 		key:          key,
 		resourceKey:  resourceKey,
 		pollInterval: pollInterval,
+		jitter:       jitter,
 		fetcher:      fetcher,
 		comparator:   comparator,
 		logger:       logger,
@@ -117,6 +124,11 @@ func (rw *resourceWatcher) run(ctx context.Context) {
 
 	for {
 		interval := rw.currentPollInterval()
+		if rw.jitter > 0 {
+			// wait.Jitter treats a non-positive factor as 1.0, so only
+			// call it when jitter is actually enabled.
+			interval = wait.Jitter(interval, rw.jitter)
+		}
 		select {
 		case <-ctx.Done():
 			return
