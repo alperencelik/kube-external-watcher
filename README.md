@@ -25,5 +25,6 @@ Operators managing external resources can't rely on Kubernetes events alone — 
 Projects using `kube-external-watcher` in the wild:
 
 - [**kubemox**](https://github.com/alperencelik/kubemox) — a Kubernetes operator for Proxmox VE that helps you to create Proxmox resources with Custom Resources and detects out-of-band changes via this library.
+- [**talos-operator**](https://github.com/alperencelik/talos-operator) — a Kubernetes operator for managing Talos Linux clusters that detects out-of-band changes via this library.
 
 Using it in your project? Open a PR to add yourself here.
