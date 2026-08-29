@@ -42,6 +42,13 @@ type ResourceStateFetcher interface {
 	// Implementations typically fetch the CR and check whether the
 	// external resource has been provisioned (e.g. status.instanceID
 	// is non-empty).
+	//
+	// IMPORTANT: auto-register calls this synchronously from the cache
+	// informer's event-handler goroutine, so it must be fast and
+	// non-blocking. Read from the controller-runtime cache (which is
+	// backed by an in-memory informer) rather than making a live external
+	// API call; a slow implementation stalls delivery of all informer
+	// events (including deletes) and buffers them without bound.
 	IsResourceReadyToWatch(ctx context.Context, key types.NamespacedName) bool
 }
 

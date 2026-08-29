@@ -262,6 +262,44 @@ func TestExternalWatcher_ReRegisterUpdatesConfig(t *testing.T) {
 	}
 }
 
+func TestExternalWatcher_ReRegisterUpdatesResourceKey(t *testing.T) {
+	fetcher := mock.NewFakeResourceStateFetcher()
+	key := types.NamespacedName{Namespace: "default", Name: "rekey"}
+	oldRK := "old-resource-id"
+	newRK := "new-resource-id"
+	fetcher.SetDesiredState(key, "desired")
+	// Old external identity matches desired (no drift); new identity drifts.
+	fetcher.SetResourceState(oldRK, "desired")
+	fetcher.SetResourceState(newRK, "different")
+
+	ew := watcher.NewExternalWatcher(fetcher,
+		watcher.WithDefaultPollInterval(30*time.Millisecond),
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	q := newTestQueue()
+	if err := ew.Start(ctx, q); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+
+	// Register with the old key — polls should observe no drift.
+	ew.Register(key, watcher.ResourceConfig{ResourceKey: oldRK})
+	if extra := drainRequests(q, 150*time.Millisecond); len(extra) != 0 {
+		t.Fatalf("expected no drift while polling the matching old key, got %d requests", len(extra))
+	}
+
+	// Re-register with a new external identifier that drifts. If the config
+	// update dropped the ResourceKey, the watcher would keep polling oldRK
+	// and never enqueue a request.
+	ew.Register(key, watcher.ResourceConfig{ResourceKey: newRK})
+
+	req := waitForRequest(t, q)
+	if req.NamespacedName != key {
+		t.Errorf("expected request for %v, got %v", key, req.NamespacedName)
+	}
+}
+
 func TestExternalWatcher_ConcurrentRegisterUnregister(t *testing.T) {
 	fetcher := mock.NewFakeResourceStateFetcher()
 	ew := watcher.NewExternalWatcher(fetcher,

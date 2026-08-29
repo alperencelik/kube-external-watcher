@@ -100,6 +100,7 @@ func TestNilMetricsCollector_NoPanic(t *testing.T) {
 	m.incRegisteredResources()
 	m.decRegisteredResources()
 	m.resetRegisteredResources()
+	m.deleteResourceMetrics("ns", "name")
 }
 
 func TestMetrics_PollSuccessIncrementsCounter(t *testing.T) {

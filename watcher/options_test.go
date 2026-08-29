@@ -2,7 +2,28 @@ package watcher
 
 import (
 	"testing"
+	"time"
 )
+
+func TestWithDefaultPollInterval(t *testing.T) {
+	tests := []struct {
+		name string
+		in   time.Duration
+		want time.Duration
+	}{
+		{"positive applied", 5 * time.Second, 5 * time.Second},
+		{"zero ignored keeps default", 0, DefaultPollInterval},
+		{"negative ignored keeps default", -1 * time.Second, DefaultPollInterval},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			w := NewExternalWatcher(&testFetcher{}, WithDefaultPollInterval(tt.in))
+			if w.defaultPollInterval != tt.want {
+				t.Errorf("defaultPollInterval = %v, want %v", w.defaultPollInterval, tt.want)
+			}
+		})
+	}
+}
 
 func TestWithPollJitter(t *testing.T) {
 	tests := []struct {

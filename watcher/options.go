@@ -1,7 +1,6 @@
 package watcher
 
 import (
-	"context"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -25,9 +24,14 @@ const DefaultPollJitter = 0.1
 type Option func(*ExternalWatcher)
 
 // WithDefaultPollInterval sets the global default poll interval.
-// Per-resource intervals in ResourceConfig take precedence.
+// Per-resource intervals in ResourceConfig take precedence. A non-positive
+// duration is ignored (the built-in DefaultPollInterval is kept), since a
+// zero interval would turn the poll loop into a hot spin.
 func WithDefaultPollInterval(d time.Duration) Option {
 	return func(w *ExternalWatcher) {
+		if d <= 0 {
+			return
+		}
 		w.defaultPollInterval = d
 	}
 }
@@ -90,7 +94,7 @@ func WithAutoRegister(c cache.Cache, obj client.Object, fn ConfigExtractorFn, op
 			cache:     c,
 			obj:       obj,
 			extractor: fn,
-			retries:   make(map[types.NamespacedName]context.CancelFunc),
+			retries:   make(map[types.NamespacedName]*readinessRetry),
 		}
 		for _, opt := range opts {
 			opt(cfg)

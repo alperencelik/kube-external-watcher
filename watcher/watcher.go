@@ -41,6 +41,10 @@ type ExternalWatcher struct {
 
 	// started indicates whether Start has been called.
 	started bool
+	// stopped indicates the owning context has been cancelled and the
+	// watcher has shut down. Once set, doRegister refuses new registrations
+	// so late informer events can't create zombie watchers.
+	stopped bool
 	ctx     context.Context
 	queue   workqueue.TypedRateLimitingInterface[reconcile.Request]
 }
@@ -89,17 +93,26 @@ func (w *ExternalWatcher) Start(ctx context.Context, queue workqueue.TypedRateLi
 
 	if w.autoRegister != nil {
 		if err := setupAutoRegister(ctx, w); err != nil {
+			// Roll back so Start can be retried once the underlying cause
+			// (e.g. an informer that wasn't ready yet) clears, instead of
+			// wedging the watcher with the misleading "called more than
+			// once" error on every subsequent attempt.
+			w.mu.Lock()
+			w.started = false
+			w.ctx = nil
+			w.queue = nil
+			w.mu.Unlock()
 			return fmt.Errorf("external watcher start: %w", err)
 		}
 	}
 
 	w.mu.Lock()
 	for key, rw := range w.watchers {
-		if !rw.running {
-			rw.start(ctx, queue)
-			w.logger.V(1).Info("started pre-registered resource watcher",
-				"resource", key.String())
-		}
+		// start is idempotent, so pre-registered watchers are safe to start
+		// unconditionally.
+		rw.start(ctx, queue)
+		w.logger.V(1).Info("started pre-registered resource watcher",
+			"resource", key.String())
 	}
 	w.mu.Unlock()
 
@@ -117,14 +130,24 @@ func (w *ExternalWatcher) shutdownOnContextDone(ctx context.Context) {
 		w.cancelAllReadinessRetries()
 	}
 
+	// Detach the watcher set under the lock (marking the watcher stopped so
+	// late doRegister calls become no-ops), then stop the goroutines outside
+	// the lock — stop blocks until each in-flight poll finishes, which must
+	// not hold up other callers of w.mu.
 	w.mu.Lock()
-	defer w.mu.Unlock()
-	for key, rw := range w.watchers {
+	w.stopped = true
+	toStop := w.watchers
+	w.watchers = make(map[types.NamespacedName]*resourceWatcher)
+	for key := range toStop {
+		w.metrics.deleteResourceMetrics(key.Namespace, key.Name)
+	}
+	w.metrics.resetRegisteredResources()
+	w.mu.Unlock()
+
+	for key, rw := range toStop {
 		rw.stop()
 		w.logger.V(1).Info("stopped resource watcher", "resource", key.String())
 	}
-	w.watchers = make(map[types.NamespacedName]*resourceWatcher)
-	w.metrics.resetRegisteredResources()
 }
 
 // Register starts watching the external state for the given resource.
@@ -150,14 +173,32 @@ func (w *ExternalWatcher) doRegister(key types.NamespacedName, config ResourceCo
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
+	// After shutdown the context is cancelled and the watcher set has been
+	// torn down; registering here would spawn a goroutine on a dead context
+	// and leave a zombie entry that skews the registered-resources gauge.
+	if w.stopped {
+		w.logger.V(1).Info("ignoring registration after shutdown", "resource", key.String())
+		return
+	}
+
 	pollInterval := w.defaultPollInterval
 	// Use config.PollInterval if set and valid. Otherwise, use the default.
 	if config.PollInterval > 0 {
 		pollInterval = config.PollInterval
 	}
+	// Guard against a non-positive default slipping through (e.g. from a
+	// misconfigured option): a zero interval makes time.After fire
+	// immediately, turning the poll loop into a hot spin.
+	if pollInterval <= 0 {
+		pollInterval = DefaultPollInterval
+	}
 
 	if existing, ok := w.watchers[key]; ok {
 		existing.updatePollInterval(pollInterval)
+		// Re-registration may carry a new external identifier (e.g. the
+		// backing resource was recreated with a new ID); honor it so we
+		// don't keep polling the stale key forever.
+		existing.updateResourceKey(config.ResourceKey)
 		w.logger.V(1).Info("updated resource watcher config",
 			"resource", key.String(), "pollInterval", pollInterval)
 		return
@@ -190,12 +231,20 @@ func (w *ExternalWatcher) Unregister(key types.NamespacedName) {
 
 func (w *ExternalWatcher) doUnregister(key types.NamespacedName) {
 	w.mu.Lock()
-	defer w.mu.Unlock()
-
-	if rw, ok := w.watchers[key]; ok {
-		rw.stop()
+	rw, ok := w.watchers[key]
+	if ok {
 		delete(w.watchers, key)
 		w.metrics.decRegisteredResources()
+		// Drop this resource's metric series so label cardinality doesn't
+		// grow without bound as short-lived resources churn.
+		w.metrics.deleteResourceMetrics(key.Namespace, key.Name)
+	}
+	w.mu.Unlock()
+
+	if ok {
+		// stop blocks until the in-flight poll finishes, so it must run
+		// outside w.mu to avoid stalling other registrations.
+		rw.stop()
 		w.logger.V(1).Info("unregistered resource watcher", "resource", key.String())
 	}
 }

@@ -139,6 +139,35 @@ func TestDeepEqualComparator_Diff(t *testing.T) {
 	}
 }
 
+func TestDeepEqualComparator_UnexportedFieldReturnsErrorNotPanic(t *testing.T) {
+	// go-cmp panics on unexported fields with no applicable option. The
+	// comparator must recover and surface that as an error so the poll loop
+	// keeps running instead of crashing the process.
+	type withUnexported struct {
+		Name   string
+		secret string // unexported — cmp.Equal panics on this
+	}
+
+	c := NewDeepEqualComparator()
+
+	drifted, err := c.HasDrifted(
+		withUnexported{Name: "db", secret: "a"},
+		withUnexported{Name: "db", secret: "b"},
+	)
+	if err == nil {
+		t.Fatal("expected an error when comparing values with unexported fields")
+	}
+	if drifted {
+		t.Error("expected drifted=false when comparison errors")
+	}
+
+	// Diff must also survive the panic and return a placeholder rather than
+	// crashing.
+	if out := c.Diff(withUnexported{secret: "a"}, withUnexported{secret: "b"}); out == "" {
+		t.Error("expected non-empty placeholder diff when comparison panics")
+	}
+}
+
 func TestDeepEqualComparator_SortSlices(t *testing.T) {
 	type state struct {
 		Tags []string

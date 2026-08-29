@@ -117,11 +117,16 @@ func (f *FakeResourceStateFetcher) FetchExternalResource(_ context.Context, objK
 
 // TransformExternalState implements watcher.ResourceStateFetcher.
 // By default returns the raw value as-is. Use SetTransformFn to override.
+//
+// The transform function is invoked without holding f.mu, so a callback is
+// free to reprogram the fake (SetResourceState, Reset, etc.) without
+// self-deadlocking on the mutex.
 func (f *FakeResourceStateFetcher) TransformExternalState(raw any) (any, error) {
 	f.mu.RLock()
-	defer f.mu.RUnlock()
-	if f.transformFn != nil {
-		return f.transformFn(raw)
+	fn := f.transformFn
+	f.mu.RUnlock()
+	if fn != nil {
+		return fn(raw)
 	}
 	return raw, nil
 }

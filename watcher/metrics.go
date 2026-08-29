@@ -140,3 +140,19 @@ func (m *metricsCollector) resetRegisteredResources() {
 	}
 	m.vecs.registeredResources.WithLabelValues(m.controller).Set(0)
 }
+
+// deleteResourceMetrics removes every per-resource metric series for the
+// given namespace/name so that label cardinality does not grow without
+// bound as resources are registered and unregistered over the lifetime of
+// a long-running controller. The registeredResources gauge is labeled only
+// by controller and is managed separately (inc/dec/reset).
+func (m *metricsCollector) deleteResourceMetrics(namespace, name string) {
+	if m == nil {
+		return
+	}
+	labels := prometheus.Labels{"controller": m.controller, "namespace": namespace, "name": name}
+	m.vecs.pollTotal.DeletePartialMatch(labels)
+	m.vecs.fetchExternalDuration.DeletePartialMatch(labels)
+	m.vecs.fetchExternalErrors.DeletePartialMatch(labels)
+	m.vecs.driftDetectedTotal.DeletePartialMatch(labels)
+}

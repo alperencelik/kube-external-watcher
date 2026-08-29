@@ -86,11 +86,15 @@ func setupTestWatcher(t *testing.T, extractor ConfigExtractorFn) (*ExternalWatch
 				MaxInterval:     20 * time.Millisecond,
 				MaxRetries:      0,
 			},
-			retries: make(map[types.NamespacedName]context.CancelFunc),
+			retries: make(map[types.NamespacedName]*readinessRetry),
 		},
 	}
 
-	if err := setupAutoRegister(context.Background(), w); err != nil {
+	// Use a cancellable informer context so readiness-retry goroutines are
+	// stopped when the test finishes instead of leaking.
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	if err := setupAutoRegister(ctx, w); err != nil {
 		t.Fatalf("setupAutoRegister failed: %v", err)
 	}
 
@@ -126,11 +130,15 @@ func setupTestWatcherWithFilter(t *testing.T, extractor ConfigExtractorFn, filte
 				MaxInterval:     20 * time.Millisecond,
 				MaxRetries:      0,
 			},
-			retries: make(map[types.NamespacedName]context.CancelFunc),
+			retries: make(map[types.NamespacedName]*readinessRetry),
 		},
 	}
 
-	if err := setupAutoRegister(context.Background(), w); err != nil {
+	// Use a cancellable informer context so readiness-retry goroutines are
+	// stopped when the test finishes instead of leaking.
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	if err := setupAutoRegister(ctx, w); err != nil {
 		t.Fatalf("setupAutoRegister failed: %v", err)
 	}
 
@@ -305,6 +313,84 @@ func TestAutoRegister_DeleteTombstoneHandled(t *testing.T) {
 	}
 }
 
+func TestAutoRegister_DeleteTombstoneKeyOnlyHandled(t *testing.T) {
+	w, fi, q, _ := setupTestWatcher(t, func(obj client.Object) ResourceConfig {
+		return ResourceConfig{ResourceKey: "resource-" + obj.GetName()}
+	})
+
+	cancel := startTestWatcher(t, w, q)
+	defer cancel()
+
+	obj := newTestObj("tombstone-keyonly")
+	fi.handler.OnAdd(obj, false)
+
+	key := types.NamespacedName{Namespace: "default", Name: "tombstone-keyonly"}
+	if !w.IsRegistered(key) {
+		t.Fatal("expected resource to be registered after Add")
+	}
+
+	// Tombstone whose Obj is not a client.Object — only the Key string is
+	// usable. The delete must still unregister the resource via the key.
+	tombstone := toolscache.DeletedFinalStateUnknown{
+		Key: "default/tombstone-keyonly",
+		Obj: "not-a-client-object",
+	}
+	fi.handler.OnDelete(tombstone)
+
+	if w.IsRegistered(key) {
+		t.Error("expected resource unregistered via tombstone key fallback")
+	}
+}
+
+func TestAutoRegister_UnregisterOnNotReadySchedulesRetry(t *testing.T) {
+	w, fi, q, fetcher := setupTestWatcher(t, func(obj client.Object) ResourceConfig {
+		return ResourceConfig{ResourceKey: "resource-" + obj.GetName()}
+	})
+
+	cancel := startTestWatcher(t, w, q)
+	defer cancel()
+
+	obj := newTestObj("blip")
+	key := types.NamespacedName{Namespace: "default", Name: "blip"}
+
+	// Register while ready.
+	fi.handler.OnAdd(obj, false)
+	if !w.IsRegistered(key) {
+		t.Fatal("expected resource registered on Add when ready")
+	}
+
+	// Becomes not ready on Update — should unregister and schedule a retry.
+	fetcher.mu.Lock()
+	fetcher.ready = false
+	fetcher.mu.Unlock()
+	fi.handler.OnUpdate(obj, obj)
+
+	if w.IsRegistered(key) {
+		t.Fatal("expected resource unregistered when no longer ready")
+	}
+	if !isRetryPending(w, key) {
+		t.Fatal("expected a readiness retry to be scheduled after not-ready unregister")
+	}
+
+	// Readiness recovers with no further informer event — the retry should
+	// re-register the resource on its own.
+	fetcher.mu.Lock()
+	fetcher.ready = true
+	fetcher.mu.Unlock()
+
+	// Assert re-registration directly (polling), rather than via the queue:
+	// the earlier registration already enqueued a drift request, so a queue
+	// read wouldn't distinguish the retry's work from that stale request.
+	deadline := time.After(2 * time.Second)
+	for !w.IsRegistered(key) {
+		select {
+		case <-deadline:
+			t.Fatal("expected resource re-registered after readiness recovered via retry")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+}
+
 func TestAutoRegister_GetInformerError(t *testing.T) {
 	fc := &fakeCache{getErr: errors.New("informer unavailable")}
 
@@ -324,6 +410,76 @@ func TestAutoRegister_GetInformerError(t *testing.T) {
 	err := setupAutoRegister(context.Background(), w)
 	if err == nil {
 		t.Fatal("expected error when GetInformer fails")
+	}
+}
+
+func TestExternalWatcher_StartRetryableAfterSetupFailure(t *testing.T) {
+	fi := &fakeInformer{}
+	fc := &fakeCache{informer: fi, getErr: errors.New("informer not ready yet")}
+	fetcher := &testFetcher{ready: true}
+
+	ew := NewExternalWatcher(fetcher,
+		WithAutoRegister(fc, &corev1.ConfigMap{}, func(o client.Object) ResourceConfig {
+			return ResourceConfig{ResourceKey: "rk-" + o.GetName()}
+		}),
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	q := workqueue.NewTypedRateLimitingQueue(
+		workqueue.DefaultTypedControllerRateLimiter[reconcile.Request](),
+	)
+
+	// First Start fails because the informer isn't available.
+	if err := ew.Start(ctx, q); err == nil {
+		t.Fatal("expected first Start to fail when GetInformer errors")
+	}
+
+	// The failure must not wedge the watcher with the misleading
+	// "Start called more than once" error: a retry should now succeed.
+	fc.getErr = nil
+	if err := ew.Start(ctx, q); err != nil {
+		t.Fatalf("expected retry of Start to succeed after transient setup failure, got %v", err)
+	}
+}
+
+func TestExternalWatcher_RegisterAfterShutdownIsNoOp(t *testing.T) {
+	fetcher := &testFetcher{ready: true}
+	fetcher.setDesiredState("desired")
+	fetcher.setResourceState("different")
+
+	ew := NewExternalWatcher(fetcher, WithDefaultPollInterval(30*time.Millisecond))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	q := workqueue.NewTypedRateLimitingQueue(
+		workqueue.DefaultTypedControllerRateLimiter[reconcile.Request](),
+	)
+	if err := ew.Start(ctx, q); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+
+	// Trigger shutdown and wait for it to mark the watcher stopped.
+	cancel()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		ew.mu.RLock()
+		stopped := ew.stopped
+		ew.mu.RUnlock()
+		if stopped {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for shutdown to mark watcher stopped")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// A straggling registration after shutdown must not create a zombie
+	// watcher.
+	key := types.NamespacedName{Namespace: "default", Name: "late"}
+	ew.doRegister(key, ResourceConfig{ResourceKey: "rk"})
+	if ew.IsRegistered(key) {
+		t.Fatal("expected registration after shutdown to be a no-op")
 	}
 }
 
@@ -719,7 +875,7 @@ func TestAutoRegister_RetryCancelledOnShutdown(t *testing.T) {
 				MaxInterval:     20 * time.Millisecond,
 				MaxRetries:      0,
 			},
-			retries: make(map[types.NamespacedName]context.CancelFunc),
+			retries: make(map[types.NamespacedName]*readinessRetry),
 		},
 	}
 
