@@ -26,8 +26,14 @@ type Option func(*ExternalWatcher)
 
 // WithDefaultPollInterval sets the global default poll interval.
 // Per-resource intervals in ResourceConfig take precedence.
+//
+// Non-positive values are ignored — a zero interval (easy to pass from an
+// unset config field) would spin every watcher goroutine.
 func WithDefaultPollInterval(d time.Duration) Option {
 	return func(w *ExternalWatcher) {
+		if d <= 0 {
+			return
+		}
 		w.defaultPollInterval = d
 	}
 }

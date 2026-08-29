@@ -455,3 +455,38 @@ func TestExternalWatcher_LastDriftAutoClearedOnCleanPoll(t *testing.T) {
 	}
 	t.Fatal("timed out waiting for LastDrift to auto-clear after clean poll")
 }
+
+// Re-registering with a different ResourceKey must repoint the running
+// watcher, not keep polling the old external resource.
+func TestExternalWatcher_ReRegisterUpdatesResourceKey(t *testing.T) {
+	fetcher := mock.NewFakeResourceStateFetcher()
+	key := types.NamespacedName{Namespace: "default", Name: "repointed"}
+	fetcher.SetDesiredState(key, "desired")
+	// The old resource matches desired state, the new one has drifted.
+	fetcher.SetResourceState("resource-old", "desired")
+	fetcher.SetResourceState("resource-new", "different")
+
+	ew := watcher.NewExternalWatcher(fetcher,
+		watcher.WithDefaultPollInterval(20*time.Millisecond),
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	q := newTestQueue()
+	if err := ew.Start(ctx, q); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+
+	ew.Register(key, watcher.ResourceConfig{ResourceKey: "resource-old"})
+	if reqs := drainRequests(q, 100*time.Millisecond); len(reqs) > 0 {
+		t.Fatalf("expected no drift against the original resource key, got %d request(s)", len(reqs))
+	}
+
+	// Repoint at the drifted resource.
+	ew.Register(key, watcher.ResourceConfig{ResourceKey: "resource-new"})
+
+	req := waitForRequest(t, q)
+	if req.NamespacedName != key {
+		t.Errorf("expected reconcile request for %v, got %v", key, req.NamespacedName)
+	}
+}

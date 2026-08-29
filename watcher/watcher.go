@@ -155,9 +155,18 @@ func (w *ExternalWatcher) doRegister(key types.NamespacedName, config ResourceCo
 	if config.PollInterval > 0 {
 		pollInterval = config.PollInterval
 	}
+	// A non-positive interval spins the poll loop. WithDefaultPollInterval
+	// rejects those, but a directly constructed watcher can still be zero.
+	if pollInterval <= 0 {
+		w.logger.Info("non-positive poll interval, falling back to the built-in default",
+			"resource", key.String(), "default", DefaultPollInterval)
+		pollInterval = DefaultPollInterval
+	}
 
 	if existing, ok := w.watchers[key]; ok {
-		existing.updatePollInterval(pollInterval)
+		// ResourceKey changes when the CR points at a recreated external
+		// resource; dropping it here would poll the old one forever.
+		existing.updateConfig(config.ResourceKey, pollInterval)
 		w.logger.V(1).Info("updated resource watcher config",
 			"resource", key.String(), "pollInterval", pollInterval)
 		return

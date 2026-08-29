@@ -158,3 +158,32 @@ func TestDeepEqualComparator_SortSlices(t *testing.T) {
 		t.Error("expected no drift when slice order differs but elements are the same")
 	}
 }
+
+// cmp panics on unexported fields. HasDrifted runs in a poll goroutine,
+// so that panic has to become an error, not a crash.
+func TestDeepEqualComparator_UnexportedFieldsReturnErrorNotPanic(t *testing.T) {
+	type externalState struct {
+		Status string
+		token  string // unexported — cmp.Equal panics on this
+	}
+
+	c := NewDeepEqualComparator()
+	desired := externalState{Status: "running", token: "a"}
+	actual := externalState{Status: "running", token: "b"}
+
+	drifted, err := c.HasDrifted(desired, actual)
+	if err == nil {
+		t.Fatal("expected an error when cmp cannot compare unexported fields")
+	}
+	if drifted {
+		t.Error("expected drifted=false when the comparison failed")
+	}
+	if !strings.Contains(err.Error(), "panicked") {
+		t.Errorf("error should report the panic, got %q", err)
+	}
+
+	// Diff has no error return, so it reports the panic inline.
+	if out := c.Diff(desired, actual); !strings.Contains(out, "panicked") {
+		t.Errorf("expected Diff to report the panic, got %q", out)
+	}
+}

@@ -278,7 +278,7 @@ func TestResourceWatcher_PollIntervalUpdate(t *testing.T) {
 		t.Errorf("expected initial poll interval 1h, got %v", got)
 	}
 
-	rw.updatePollInterval(30 * time.Second)
+	rw.updateConfig("resource-key-1", 30*time.Second)
 
 	if got := rw.currentPollInterval(); got != 30*time.Second {
 		t.Errorf("expected updated poll interval 30s, got %v", got)
@@ -565,5 +565,86 @@ func TestResourceWatcher_WithoutStatusUpdaterStillWorks(t *testing.T) {
 	}
 	if req.NamespacedName != key {
 		t.Errorf("expected request for %v, got %v", key, req.NamespacedName)
+	}
+}
+
+// A panic in user code must cost one poll cycle, not the process.
+func TestResourceWatcher_PanicInFetcherIsContained(t *testing.T) {
+	fetcher := &testFetcher{}
+	fetcher.setDesiredState("desired")
+	fetcher.setResourceState("actual")
+	fetcher.transformFn = func(any) (any, error) {
+		panic("external SDK blew up")
+	}
+
+	key := types.NamespacedName{Namespace: "default", Name: "panicking"}
+	rw := newResourceWatcher(key, "resource-key", 10*time.Millisecond, 0,
+		fetcher, NewDeepEqualComparator(), logr.Discard(), nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	q := newTestRequestQueue()
+	rw.start(ctx, q)
+
+	// The loop must survive the panic and keep polling.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && fetcher.desiredCalls.Load() < 3 {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := fetcher.desiredCalls.Load(); got < 3 {
+		t.Fatalf("expected polling to continue after a panic, got %d poll(s)", got)
+	}
+
+	// A panicking poll produces no drift event.
+	if q.Len() != 0 {
+		t.Errorf("expected no reconcile requests from panicking polls, got %d", q.Len())
+	}
+}
+
+// Same for a custom comparator that panics.
+func TestResourceWatcher_PanicInComparatorIsContained(t *testing.T) {
+	fetcher := &testFetcher{}
+	fetcher.setDesiredState("desired")
+	fetcher.setResourceState("different")
+
+	key := types.NamespacedName{Namespace: "default", Name: "panicking-comparator"}
+	rw := newResourceWatcher(key, "resource-key", 10*time.Millisecond, 0,
+		fetcher, panicComparator{}, logr.Discard(), nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	rw.start(ctx, newTestRequestQueue())
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && fetcher.desiredCalls.Load() < 3 {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := fetcher.desiredCalls.Load(); got < 3 {
+		t.Fatalf("expected polling to continue after a comparator panic, got %d poll(s)", got)
+	}
+}
+
+// panicComparator exercises the guard in the poll loop itself;
+// DeepEqualComparator recovers on its own.
+type panicComparator struct{}
+
+func (panicComparator) HasDrifted(_, _ any) (bool, error) { panic("comparator blew up") }
+func (panicComparator) Diff(_, _ any) string              { panic("comparator blew up") }
+
+// A repointed resource must be polled with the new key.
+func TestResourceWatcher_UpdateConfigChangesResourceKey(t *testing.T) {
+	fetcher := &testFetcher{}
+	key := types.NamespacedName{Namespace: "default", Name: "repointed"}
+	rw := newResourceWatcher(key, "resource-old", time.Hour, 0,
+		fetcher, NewDeepEqualComparator(), logr.Discard(), nil)
+
+	if got := rw.currentResourceKey(); got != "resource-old" {
+		t.Fatalf("initial resource key = %v, want resource-old", got)
+	}
+
+	rw.updateConfig("resource-new", time.Hour)
+
+	if got := rw.currentResourceKey(); got != "resource-new" {
+		t.Errorf("resource key = %v, want resource-new", got)
 	}
 }

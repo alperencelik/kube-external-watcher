@@ -137,9 +137,11 @@ func setupAutoRegister(ctx context.Context, w *ExternalWatcher) error {
 					w.doUnregister(key)
 					w.logger.V(1).Info("auto-unregistered resource (no longer ready)", "resource", key.String())
 				} else {
-					w.logger.V(2).Info("auto-register: resource not ready on update, starting retry", "resource", key.String())
-					w.startReadinessRetry(ctx, key, cNew)
+					w.logger.V(2).Info("auto-register: resource not ready on update", "resource", key.String())
 				}
+				// Readiness can recover with no change to the object, and
+				// so no new event. Without a retry it stays unwatched.
+				w.startReadinessRetry(ctx, key, cNew)
 				return
 			}
 			w.cancelReadinessRetry(key)
@@ -193,12 +195,16 @@ func (w *ExternalWatcher) startReadinessRetry(ctx context.Context, key types.Nam
 	cfg := ar.retryConfig
 	w.logger.V(1).Info("auto-register: starting readiness retry", "resource", key.String())
 
+	retryLogger := w.logger.WithValues("resource", key.String())
+
 	go func() {
 		defer func() {
 			ar.mu.Lock()
 			delete(ar.retries, key)
 			ar.mu.Unlock()
 		}()
+		// Contain panics from the readiness check and extractor.
+		defer recoverPanic(retryLogger, "recovered from panic during readiness retry", nil)
 
 		interval := cfg.InitialInterval
 		attempts := 0
