@@ -16,7 +16,10 @@ import (
 // desired state from Kubernetes, the actual state from an external API,
 // detects drift, and enqueues a reconcile.Request when drift is found.
 type resourceWatcher struct {
-	key         types.NamespacedName
+	key types.NamespacedName
+
+	// resourceKey is the external resource ID. It can change while the
+	// watcher runs, so mu guards it.
 	resourceKey any
 
 	fetcher    ResourceStateFetcher
@@ -34,7 +37,7 @@ type resourceWatcher struct {
 
 	metrics *metricsCollector
 
-	// mu protects pollInterval for dynamic updates.
+	// mu protects resourceKey and pollInterval for dynamic updates.
 	mu           sync.Mutex
 	pollInterval time.Duration
 
@@ -85,10 +88,19 @@ func (rw *resourceWatcher) stop() {
 	rw.running = false
 }
 
-func (rw *resourceWatcher) updatePollInterval(d time.Duration) {
+// updateConfig re-configures a running watcher. The next poll picks up
+// the new values.
+func (rw *resourceWatcher) updateConfig(resourceKey any, pollInterval time.Duration) {
 	rw.mu.Lock()
 	defer rw.mu.Unlock()
-	rw.pollInterval = d
+	rw.resourceKey = resourceKey
+	rw.pollInterval = pollInterval
+}
+
+func (rw *resourceWatcher) currentResourceKey() any {
+	rw.mu.Lock()
+	defer rw.mu.Unlock()
+	return rw.resourceKey
 }
 
 func (rw *resourceWatcher) currentPollInterval() time.Duration {
@@ -142,6 +154,12 @@ func (rw *resourceWatcher) run(ctx context.Context) {
 func (rw *resourceWatcher) poll(ctx context.Context) {
 	ns, name := rw.key.Namespace, rw.key.Name
 
+	// Contain panics from user code (fetcher, comparator) to this cycle
+	// instead of letting them kill the process.
+	defer recoverPanic(rw.logger, "recovered from panic during poll cycle", func() {
+		rw.metrics.incPollTotal(ns, name, "panic")
+	})
+
 	desired, err := rw.fetcher.GetDesiredState(ctx, rw.key)
 	if err != nil {
 		rw.logger.Error(err, "failed to fetch desired state")
@@ -150,7 +168,7 @@ func (rw *resourceWatcher) poll(ctx context.Context) {
 	}
 
 	fetchStart := time.Now()
-	rawExternal, err := rw.fetcher.FetchExternalResource(ctx, rw.resourceKey)
+	rawExternal, err := rw.fetcher.FetchExternalResource(ctx, rw.currentResourceKey())
 	rw.metrics.observeFetchDuration(ns, name, time.Since(fetchStart))
 	if err != nil {
 		rw.logger.Error(err, "failed to fetch external resource state")

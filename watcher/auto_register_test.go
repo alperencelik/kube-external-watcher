@@ -856,3 +856,45 @@ func TestAutoRegister_ManualUnregisterAllowedWhenAutoRegisterEnabled(t *testing.
 		t.Fatal("expected auto-register to re-register the resource on update event")
 	}
 }
+
+// Unregistering on a not-ready Update is not enough: readiness can come
+// back with no new event, so a retry has to keep watching for it.
+func TestAutoRegister_RetryScheduledWhenUpdateMakesUnready(t *testing.T) {
+	w, fi, q, fetcher := setupTestWatcher(t, func(obj client.Object) ResourceConfig {
+		return ResourceConfig{ResourceKey: "resource-" + obj.GetName()}
+	})
+
+	cancel := startTestWatcher(t, w, q)
+	defer cancel()
+
+	obj := newTestObj("blipping")
+	key := types.NamespacedName{Namespace: "default", Name: "blipping"}
+
+	fi.handler.OnAdd(obj, false)
+	if !w.IsRegistered(key) {
+		t.Fatal("expected resource to be registered on Add when ready")
+	}
+
+	// External dependency blips: not ready on the next Update.
+	fetcher.mu.Lock()
+	fetcher.ready = false
+	fetcher.mu.Unlock()
+	fi.handler.OnUpdate(obj, obj)
+
+	if w.IsRegistered(key) {
+		t.Fatal("expected resource to be unregistered once no longer ready")
+	}
+	if !isRetryPending(w, key) {
+		t.Fatal("expected a readiness retry to be scheduled after unregistering")
+	}
+
+	// Readiness recovers with no new event; the retry must re-register.
+	fetcher.mu.Lock()
+	fetcher.ready = true
+	fetcher.mu.Unlock()
+
+	waitForRetryDone(t, w, key)
+	if !w.IsRegistered(key) {
+		t.Fatal("expected the readiness retry to re-register the resource")
+	}
+}
