@@ -17,7 +17,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
-type fakeRegistration struct{}
+type fakeRegistration struct {
+	toolscache.ResourceEventHandlerRegistration // embed interface for only HasSynced is implemented
+}
 
 func (f *fakeRegistration) HasSynced() bool { return true }
 
