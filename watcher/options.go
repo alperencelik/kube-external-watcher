@@ -1,7 +1,6 @@
 package watcher
 
 import (
-	"context"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -96,7 +95,7 @@ func WithAutoRegister(c cache.Cache, obj client.Object, fn ConfigExtractorFn, op
 			cache:     c,
 			obj:       obj,
 			extractor: fn,
-			retries:   make(map[types.NamespacedName]context.CancelFunc),
+			retries:   make(map[types.NamespacedName]*readinessRetry),
 		}
 		for _, opt := range opts {
 			opt(cfg)

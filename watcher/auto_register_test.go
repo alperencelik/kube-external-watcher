@@ -3,11 +3,13 @@ package watcher
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	toolscache "k8s.io/client-go/tools/cache"
@@ -23,20 +25,70 @@ type fakeRegistration struct {
 
 func (f *fakeRegistration) HasSynced() bool { return true }
 
+// fakeInformer keeps a store of objects that, like a real informer, is
+// updated before the event handler runs, so fakeCache.Get sees it.
 type fakeInformer struct {
 	cache.Informer // embed interface for only AddEventHandler is implemented
 	handler        toolscache.ResourceEventHandler
+
+	mu    sync.Mutex
+	store map[types.NamespacedName]client.Object
+}
+
+func (f *fakeInformer) setStored(obj any, deleted bool) {
+	if d, ok := obj.(toolscache.DeletedFinalStateUnknown); ok {
+		obj = d.Obj
+	}
+	cObj, ok := obj.(client.Object)
+	if !ok {
+		return
+	}
+	key := types.NamespacedName{Namespace: cObj.GetNamespace(), Name: cObj.GetName()}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.store == nil {
+		f.store = make(map[types.NamespacedName]client.Object)
+	}
+	if deleted {
+		delete(f.store, key)
+	} else {
+		f.store[key] = cObj.DeepCopyObject().(client.Object)
+	}
 }
 
 func (f *fakeInformer) AddEventHandler(handler toolscache.ResourceEventHandler) (toolscache.ResourceEventHandlerRegistration, error) {
-	f.handler = handler
+	f.handler = toolscache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj any) {
+			f.setStored(obj, false)
+			handler.OnAdd(obj, false)
+		},
+		UpdateFunc: func(oldObj, newObj any) {
+			f.setStored(newObj, false)
+			handler.OnUpdate(oldObj, newObj)
+		},
+		DeleteFunc: func(obj any) {
+			f.setStored(obj, true)
+			handler.OnDelete(obj)
+		},
+	}
 	return &fakeRegistration{}, nil
 }
 
 type fakeCache struct {
-	cache.Cache // embed interface for only GetInformer is implemented
+	cache.Cache // embed interface for only GetInformer and Get are implemented
 	informer    *fakeInformer
 	getErr      error
+}
+
+func (f *fakeCache) Get(_ context.Context, key client.ObjectKey, obj client.Object, _ ...client.GetOption) error {
+	f.informer.mu.Lock()
+	defer f.informer.mu.Unlock()
+	stored, ok := f.informer.store[key]
+	if !ok {
+		return apierrors.NewNotFound(corev1.Resource("configmaps"), key.Name)
+	}
+	stored.(*corev1.ConfigMap).DeepCopyInto(obj.(*corev1.ConfigMap))
+	return nil
 }
 
 func (f *fakeCache) GetInformer(_ context.Context, _ client.Object, _ ...cache.InformerGetOption) (cache.Informer, error) {
@@ -88,7 +140,7 @@ func setupTestWatcher(t *testing.T, extractor ConfigExtractorFn) (*ExternalWatch
 				MaxInterval:     20 * time.Millisecond,
 				MaxRetries:      0,
 			},
-			retries: make(map[types.NamespacedName]context.CancelFunc),
+			retries: make(map[types.NamespacedName]*readinessRetry),
 		},
 	}
 
@@ -128,7 +180,7 @@ func setupTestWatcherWithFilter(t *testing.T, extractor ConfigExtractorFn, filte
 				MaxInterval:     20 * time.Millisecond,
 				MaxRetries:      0,
 			},
-			retries: make(map[types.NamespacedName]context.CancelFunc),
+			retries: make(map[types.NamespacedName]*readinessRetry),
 		},
 	}
 
@@ -721,7 +773,7 @@ func TestAutoRegister_RetryCancelledOnShutdown(t *testing.T) {
 				MaxInterval:     20 * time.Millisecond,
 				MaxRetries:      0,
 			},
-			retries: make(map[types.NamespacedName]context.CancelFunc),
+			retries: make(map[types.NamespacedName]*readinessRetry),
 		},
 	}
 
@@ -898,5 +950,114 @@ func TestAutoRegister_RetryScheduledWhenUpdateMakesUnready(t *testing.T) {
 	waitForRetryDone(t, w, key)
 	if !w.IsRegistered(key) {
 		t.Fatal("expected the readiness retry to re-register the resource")
+	}
+}
+
+// A Delete that lands between the retry's readiness check and its register
+// must win: the resource must not come back as a zombie watcher.
+func TestAutoRegister_RetryDoesNotRegisterDeletedResource(t *testing.T) {
+	w, fi, q, fetcher := setupTestWatcher(t, func(obj client.Object) ResourceConfig {
+		return ResourceConfig{ResourceKey: "resource-" + obj.GetName()}
+	})
+
+	cancel := startTestWatcher(t, w, q)
+	defer cancel()
+
+	obj := newTestObj("deleted-mid-retry")
+	key := types.NamespacedName{Namespace: "default", Name: "deleted-mid-retry"}
+
+	// First check (Add handler) says not ready; the retry's check reports
+	// ready but the object is deleted before it can register.
+	var calls int
+	fetcher.mu.Lock()
+	fetcher.readyFn = func() bool {
+		calls++
+		if calls == 1 {
+			return false
+		}
+		fi.handler.OnDelete(obj)
+		return true
+	}
+	fetcher.mu.Unlock()
+
+	fi.handler.OnAdd(obj, false)
+	waitForRetryDone(t, w, key)
+
+	if w.IsRegistered(key) {
+		t.Fatal("expected deleted resource not to be registered by the retry")
+	}
+}
+
+// A retry that exits after being replaced must not remove its successor.
+func TestAutoRegister_FinishedRetryKeepsNewerRetry(t *testing.T) {
+	w, fi, q, fetcher := setupTestWatcher(t, func(obj client.Object) ResourceConfig {
+		return ResourceConfig{ResourceKey: "resource-" + obj.GetName()}
+	})
+
+	cancel := startTestWatcher(t, w, q)
+	defer cancel()
+
+	obj := newTestObj("replaced-retry")
+	key := types.NamespacedName{Namespace: "default", Name: "replaced-retry"}
+
+	// On the first retry check, replace the running retry with a new one
+	// for the same key. The old one then sees its ctx cancelled and exits.
+	var calls int
+	fetcher.mu.Lock()
+	fetcher.readyFn = func() bool {
+		calls++
+		if calls == 2 {
+			w.cancelReadinessRetry(key)
+			w.startReadinessRetry(context.Background(), key)
+		}
+		return false
+	}
+	fetcher.mu.Unlock()
+
+	fi.handler.OnAdd(obj, false)
+
+	// Give the replaced retry time to exit and run its cleanup.
+	time.Sleep(50 * time.Millisecond)
+	if !isRetryPending(w, key) {
+		t.Fatal("expected the newer retry to still be tracked")
+	}
+	w.cancelReadinessRetry(key)
+}
+
+// The retry must register from the latest object, not the one it started with.
+func TestAutoRegister_RetryUsesLatestObject(t *testing.T) {
+	w, fi, q, fetcher := setupTestWatcher(t, func(obj client.Object) ResourceConfig {
+		return ResourceConfig{ResourceKey: obj.(*corev1.ConfigMap).Data["id"]}
+	})
+
+	fetcher.mu.Lock()
+	fetcher.ready = false
+	fetcher.mu.Unlock()
+
+	cancel := startTestWatcher(t, w, q)
+	defer cancel()
+
+	oldObj := newTestObj("changed-while-waiting").(*corev1.ConfigMap)
+	oldObj.Data = map[string]string{"id": "old"}
+	newObj := oldObj.DeepCopy()
+	newObj.Data["id"] = "new"
+	key := types.NamespacedName{Namespace: "default", Name: "changed-while-waiting"}
+
+	fi.handler.OnAdd(oldObj, false)
+	fi.handler.OnUpdate(oldObj, newObj) // still not ready; retry keeps running
+
+	fetcher.mu.Lock()
+	fetcher.ready = true
+	fetcher.mu.Unlock()
+	waitForRetryDone(t, w, key)
+
+	w.mu.RLock()
+	rw, ok := w.watchers[key]
+	w.mu.RUnlock()
+	if !ok {
+		t.Fatal("expected resource to be registered after retry")
+	}
+	if got := rw.currentResourceKey(); got != "new" {
+		t.Errorf("expected ResourceKey from latest object %q, got %v", "new", got)
 	}
 }

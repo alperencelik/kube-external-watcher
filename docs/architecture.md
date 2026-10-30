@@ -25,7 +25,7 @@ Lifecycle:
 
 ### Auto-Registration (watcher/auto_register.go)
 
-If users want to automatically register/unregister resources with the help of `informer`, they can use the  `WithAutoRegister(cache, obj, extractorFn)` option when creating the `ExternalWatcher`. This hooks into the controller-runtime cache informer for the specified object type. That hooks into the controller-runtime cache informer for the given object type:
+If users want to automatically register/unregister resources with the help of `informer`, they can use the `WithAutoRegister(cache, obj, extractorFn)` option when creating the `ExternalWatcher`. This hooks into the controller-runtime cache informer for the given object type:
 
 - **Add/Update events**: Calls `fetcher.IsResourceReadyToWatch(ctx, key)` first. If false, the resource is skipped (or unregistered if previously registered). If true, calls `extractorFn(obj)` to get a `ResourceConfig` and registers the resource.
 - **Delete events**: Calls `Unregister(key)`. Handles `DeletedFinalStateUnknown` tombstones.

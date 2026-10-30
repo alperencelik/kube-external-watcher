@@ -26,6 +26,7 @@ type testFetcher struct {
 	desiredCalls  atomic.Int64
 	resourceCalls atomic.Int64
 	ready         bool                   // controls IsResourceReadyToWatch; default false (set to true in helpers)
+	readyFn       func() bool            // optional; overrides ready when set
 	transformFn   func(any) (any, error) // optional transform; default identity
 }
 
@@ -57,8 +58,12 @@ func (f *testFetcher) FetchExternalResource(_ context.Context, _ any) (any, erro
 
 func (f *testFetcher) IsResourceReadyToWatch(_ context.Context, _ types.NamespacedName) bool {
 	f.mu.RLock()
-	defer f.mu.RUnlock()
-	return f.ready
+	ready, fn := f.ready, f.readyFn
+	f.mu.RUnlock()
+	if fn != nil {
+		return fn()
+	}
+	return ready
 }
 
 func (f *testFetcher) TransformExternalState(raw any) (any, error) {

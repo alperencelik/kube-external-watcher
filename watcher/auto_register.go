@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
 	toolscache "k8s.io/client-go/tools/cache"
@@ -87,9 +88,16 @@ type autoRegisterConfig struct {
 
 	retryConfig ReadinessRetryConfig
 
-	// mutex for the retries map.
+	// mu guards retries. Cancelling a retry happens under mu, so a retry
+	// that holds mu and sees its context alive has not been cancelled.
 	mu      sync.Mutex
-	retries map[types.NamespacedName]context.CancelFunc
+	retries map[types.NamespacedName]*readinessRetry
+}
+
+// readinessRetry is one pending retry goroutine. The pointer is its
+// identity: a finished retry must not remove a newer one for the same key.
+type readinessRetry struct {
+	cancel context.CancelFunc
 }
 
 // setupAutoRegister hooks into the cache informer for the configured
@@ -114,7 +122,7 @@ func setupAutoRegister(ctx context.Context, w *ExternalWatcher) error {
 			key := types.NamespacedName{Name: cObj.GetName(), Namespace: cObj.GetNamespace()}
 			if !w.fetcher.IsResourceReadyToWatch(ctx, key) {
 				w.logger.V(2).Info("auto-register: resource not ready, starting retry", "resource", key.String())
-				w.startReadinessRetry(ctx, key, cObj)
+				w.startReadinessRetry(ctx, key)
 				return
 			}
 			w.cancelReadinessRetry(key)
@@ -141,7 +149,7 @@ func setupAutoRegister(ctx context.Context, w *ExternalWatcher) error {
 				}
 				// Readiness can recover with no change to the object, and
 				// so no new event. Without a retry it stays unwatched.
-				w.startReadinessRetry(ctx, key, cNew)
+				w.startReadinessRetry(ctx, key)
 				return
 			}
 			w.cancelReadinessRetry(key)
@@ -176,8 +184,8 @@ func setupAutoRegister(ctx context.Context, w *ExternalWatcher) error {
 
 // startReadinessRetry starts a per-resource goroutine that periodically
 // re-checks IsResourceReadyToWatch with exponential backoff. Once ready,
-// it extracts config and calls Register.
-func (w *ExternalWatcher) startReadinessRetry(ctx context.Context, key types.NamespacedName, obj client.Object) {
+// it extracts config from the latest cached object and registers it.
+func (w *ExternalWatcher) startReadinessRetry(ctx context.Context, key types.NamespacedName) {
 	ar := w.autoRegister
 	ar.mu.Lock()
 	if _, exists := ar.retries[key]; exists {
@@ -185,12 +193,9 @@ func (w *ExternalWatcher) startReadinessRetry(ctx context.Context, key types.Nam
 		return
 	}
 	retryCtx, cancel := context.WithCancel(ctx)
-	ar.retries[key] = cancel
+	self := &readinessRetry{cancel: cancel}
+	ar.retries[key] = self
 	ar.mu.Unlock()
-
-	// Deep-copy the object so the goroutine doesn't read a stale or
-	// mutated informer-managed pointer when it eventually succeeds.
-	objCopy := obj.DeepCopyObject().(client.Object)
 
 	cfg := ar.retryConfig
 	w.logger.V(1).Info("auto-register: starting readiness retry", "resource", key.String())
@@ -199,8 +204,11 @@ func (w *ExternalWatcher) startReadinessRetry(ctx context.Context, key types.Nam
 
 	go func() {
 		defer func() {
+			cancel()
 			ar.mu.Lock()
-			delete(ar.retries, key)
+			if ar.retries[key] == self {
+				delete(ar.retries, key)
+			}
 			ar.mu.Unlock()
 		}()
 		// Contain panics from the readiness check and extractor.
@@ -228,11 +236,13 @@ func (w *ExternalWatcher) startReadinessRetry(ctx context.Context, key types.Nam
 
 			attempts++
 			if w.fetcher.IsResourceReadyToWatch(retryCtx, key) {
-				config := ar.extractor(objCopy)
-				w.doRegister(key, config)
-				w.logger.V(1).Info("auto-register: resource became ready after retry",
-					"resource", key.String(), "attempts", attempts)
-				return
+				done, err := w.completeReadinessRetry(retryCtx, key)
+				if done {
+					w.logger.V(1).Info("auto-register: readiness retry finished",
+						"resource", key.String(), "attempts", attempts)
+					return
+				}
+				retryLogger.Error(err, "auto-register: failed to read object from cache")
 			}
 
 			w.logger.V(2).Info("auto-register: resource still not ready",
@@ -253,13 +263,40 @@ func (w *ExternalWatcher) startReadinessRetry(ctx context.Context, key types.Nam
 	}()
 }
 
+// completeReadinessRetry registers key from the latest cached object. The
+// object that started the retry may be stale, and a NotFound means the
+// resource was deleted while we waited. It returns false with an error
+// when the cache read fails, so the caller keeps retrying.
+func (w *ExternalWatcher) completeReadinessRetry(ctx context.Context, key types.NamespacedName) (bool, error) {
+	ar := w.autoRegister
+	obj := ar.obj.DeepCopyObject().(client.Object)
+	if err := ar.cache.Get(ctx, key, obj); err != nil {
+		if apierrors.IsNotFound(err) {
+			return true, nil
+		}
+		return false, err
+	}
+	config := ar.extractor(obj)
+
+	// A Delete cancels us under ar.mu before unregistering, so checking
+	// ctx under the lock means we either register before its unregister
+	// or not at all — never after it.
+	ar.mu.Lock()
+	defer ar.mu.Unlock()
+	if ctx.Err() != nil {
+		return true, nil
+	}
+	w.doRegister(key, config)
+	return true, nil
+}
+
 // cancelReadinessRetry cancels the retry goroutine for the given key
 func (w *ExternalWatcher) cancelReadinessRetry(key types.NamespacedName) {
 	ar := w.autoRegister
 	ar.mu.Lock()
 	defer ar.mu.Unlock()
-	if cancel, ok := ar.retries[key]; ok {
-		cancel()
+	if r, ok := ar.retries[key]; ok {
+		r.cancel()
 		delete(ar.retries, key)
 	}
 }
@@ -269,8 +306,8 @@ func (w *ExternalWatcher) cancelAllReadinessRetries() {
 	ar := w.autoRegister
 	ar.mu.Lock()
 	defer ar.mu.Unlock()
-	for _, cancel := range ar.retries {
-		cancel()
+	for _, r := range ar.retries {
+		r.cancel()
 	}
-	ar.retries = make(map[types.NamespacedName]context.CancelFunc)
+	ar.retries = make(map[types.NamespacedName]*readinessRetry)
 }

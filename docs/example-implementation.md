@@ -170,10 +170,15 @@ func main() {
                     ResourceKey:     cr.Status.InstanceID,
                 }
             },
-            // Optional: skip status-only updates and tune readiness retries.
+            // Optional: skip updates that can't affect registration
+            // (our own status writes, resyncs) and tune readiness retries.
+            // Readiness and ResourceKey come from status.instanceID, so
+            // changes to it must pass the filter too.
             watcher.AutoRegisterWithFilter(watcher.EventFilter{
                 Update: func(oldObj, newObj client.Object) bool {
-                    return oldObj.GetGeneration() != newObj.GetGeneration()
+                    o, n := oldObj.(*myv1.Database), newObj.(*myv1.Database)
+                    return o.GetGeneration() != n.GetGeneration() ||
+                        o.Status.InstanceID != n.Status.InstanceID
                 },
             }),
             watcher.AutoRegisterWithReadinessRetry(watcher.ReadinessRetryConfig{
