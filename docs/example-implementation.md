@@ -91,6 +91,11 @@ func (f *DatabaseFetcher) GetDesiredState(ctx context.Context, key types.Namespa
 func (f *DatabaseFetcher) FetchExternalResource(ctx context.Context, objKey any) (any, error) {
     instanceID := objKey.(string)
     instance, err := f.CloudClient.DescribeInstance(ctx, instanceID)
+    if cloud.IsNotFound(err) {
+        // A definite not-found triggers reconciliation. Keep timeouts and
+        // outages as ordinary errors, so they're only logged and retried.
+        return nil, fmt.Errorf("instance %s: %w", instanceID, watcher.ErrExternalResourceNotFound)
+    }
     if err != nil {
         return nil, err
     }
@@ -423,3 +428,33 @@ Notes:
 - `LastDrift` returns `(DriftInfo{}, false)` when no drift is recorded — including when reconcile fires from a regular CR update — so the Event is only emitted on drift-triggered reconciles.
 - `DriftInfo.Diff` is produced by the configured `StateComparator.Diff`. The default `DeepEqualComparator` uses `cmp.Diff` with the same `cmp.Options` it uses for `HasDrifted`, so the diff respects any `IgnoreFields`/`SortSlices` you pass in.
 - The watcher auto-clears the entry on the next poll where states match again, so a follow-up reconcile after a successful fix sees no drift.
+
+## 7. Reacting to a removed external resource (optional)
+
+When `FetchExternalResource` returns `watcher.ErrExternalResourceNotFound`, the watcher triggers a reconcile with `DriftInfo.Reason` set to `DriftReasonNotFound`. The watcher only detects the removal, so what happens next is up to your reconciler:
+
+```go
+func (r *DatabaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+    var db myv1.Database
+    if err := r.Get(ctx, req.NamespacedName, &db); err != nil {
+        return ctrl.Result{}, client.IgnoreNotFound(err)
+    }
+    if !db.DeletionTimestamp.IsZero() {
+        return ctrl.Result{}, nil // ... finalizer handling ...
+    }
+
+    if d, ok := r.Watcher.LastDrift(req.NamespacedName); ok && d.Reason == watcher.DriftReasonNotFound {
+        // Confirm with your own read before acting on it, then recreate
+        // the resource, or only report it if this CR must not recreate it.
+    }
+
+    // ...
+    return ctrl.Result{}, nil
+}
+```
+
+Notes:
+
+- The reconcile repeats on every poll until the resource is back, which also retries a failed recreate. Record the removal in a status condition, not a new Event on each reconcile.
+- `UpdateResourceStatus` doesn't run while the resource is missing, so `.status` keeps its last-seen values until your reconciler updates it.
+- `DriftInfo.Reason` tells you the last observation, not the current state, so `LastDrift` clears only after a poll finds the resource and its state matches.

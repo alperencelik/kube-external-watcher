@@ -290,6 +290,17 @@ func (w *ExternalWatcher) completeReadinessRetry(ctx context.Context, key types.
 	return true, nil
 }
 
+// latestResourceKey returns the external resource ID from the latest
+// cached object for key.
+func (w *ExternalWatcher) latestResourceKey(ctx context.Context, key types.NamespacedName) (any, error) {
+	ar := w.autoRegister
+	obj := ar.obj.DeepCopyObject().(client.Object)
+	if err := ar.cache.Get(ctx, key, obj); err != nil {
+		return nil, err
+	}
+	return ar.extractor(obj).ResourceKey, nil
+}
+
 // cancelReadinessRetry cancels the retry goroutine for the given key
 func (w *ExternalWatcher) cancelReadinessRetry(key types.NamespacedName) {
 	ar := w.autoRegister

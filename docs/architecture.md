@@ -39,6 +39,9 @@ One goroutine per registered resource:
 1. Initial poll on start.
 2. Loop: wait `pollInterval` (stretched by a random jitter of up to `WithPollJitter` factor) → `GetDesiredState` → `FetchExternalResource` → `TransformExternalState` → `HasDrifted(desired, transformed)` → enqueue `reconcile.Request` on the controller's workqueue if drifted.
 3. Fetch/transform/compare errors logged, do not trigger reconciliation, loop continues.
+4. The exception is `ErrExternalResourceNotFound` from `FetchExternalResource`. The poll skips the status update and the comparison, records a `DriftInfo` with `DriftReasonNotFound`, and enqueues a `reconcile.Request`. It repeats on every poll until the resource is back. A fetcher that never returns the sentinel behaves as before.
+
+For auto-registered resources, the poll first re-reads the CR from the cache and re-runs the extractor. If the `ResourceKey` has changed, for example because an `EventFilter` dropped the update carrying a new ID, the watcher switches to the new key and reports nothing. If that read fails, it skips reporting and tries again on the next poll. This only protects against false removals: if the old ID still exists, the fetch succeeds and the watcher keeps polling it, so filters must still pass `ResourceKey` changes. In manual mode, the reconciler keeps the key current through `Register`.
 
 ### Event Bridge
 

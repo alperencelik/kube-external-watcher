@@ -175,6 +175,11 @@ func (w *ExternalWatcher) doRegister(key types.NamespacedName, config ResourceCo
 	rw := newResourceWatcher(key, config.ResourceKey, pollInterval, w.pollJitter,
 		w.fetcher, w.comparator, w.logger.WithValues("resource", key.String()),
 		w.metrics)
+	if w.autoRegister != nil {
+		rw.resolveKey = func(ctx context.Context) (any, error) {
+			return w.latestResourceKey(ctx, key)
+		}
+	}
 
 	w.watchers[key] = rw
 	w.metrics.incRegisteredResources()

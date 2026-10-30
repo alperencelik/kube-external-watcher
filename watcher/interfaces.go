@@ -2,10 +2,22 @@ package watcher
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"k8s.io/apimachinery/pkg/types"
 )
+
+// ErrExternalResourceNotFound is returned (optionally wrapped) by
+// FetchExternalResource when the external system confirms the resource
+// does not exist. The watcher treats it as drift rather than a fetch
+// failure: it records a DriftInfo with DriftReasonNotFound and triggers
+// reconciliation on every poll until the resource is back.
+//
+// Only return it for a definite not-found. Errors from timeouts, outages
+// or wrong credentials must stay ordinary errors, otherwise a controller
+// may recreate a resource that still exists.
+var ErrExternalResourceNotFound = errors.New("external resource not found")
 
 // ResourceStateFetcher bridges Kubernetes and external resource state
 // for drift detection. Users implement this interface to provide the
@@ -26,6 +38,10 @@ type ResourceStateFetcher interface {
 	// The returned value is passed to TransformExternalState to
 	// normalize it into the same shape as the desired state before
 	// comparison.
+	//
+	// Return ErrExternalResourceNotFound when the resource does not
+	// exist, so the watcher can trigger reconciliation. Any other error
+	// is logged and retried on the next poll.
 	FetchExternalResource(ctx context.Context, objKey any) (any, error)
 
 	// TransformExternalState normalizes the raw external API response

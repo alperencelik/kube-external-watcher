@@ -3,6 +3,7 @@ package watcher
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -27,6 +28,7 @@ type testFetcher struct {
 	resourceCalls atomic.Int64
 	ready         bool                   // controls IsResourceReadyToWatch; default false (set to true in helpers)
 	readyFn       func() bool            // optional; overrides ready when set
+	fetchFn       func(any) (any, error) // optional; overrides resourceState and resourceErr when set
 	transformFn   func(any) (any, error) // optional transform; default identity
 }
 
@@ -49,11 +51,15 @@ func (f *testFetcher) GetDesiredState(_ context.Context, _ types.NamespacedName)
 	return f.desiredState, f.desiredErr
 }
 
-func (f *testFetcher) FetchExternalResource(_ context.Context, _ any) (any, error) {
+func (f *testFetcher) FetchExternalResource(_ context.Context, objKey any) (any, error) {
 	f.resourceCalls.Add(1)
 	f.mu.RLock()
-	defer f.mu.RUnlock()
-	return f.resourceState, f.resourceErr
+	state, err, fn := f.resourceState, f.resourceErr, f.fetchFn
+	f.mu.RUnlock()
+	if fn != nil {
+		return fn(objKey)
+	}
+	return state, err
 }
 
 func (f *testFetcher) IsResourceReadyToWatch(_ context.Context, _ types.NamespacedName) bool {
@@ -651,5 +657,168 @@ func TestResourceWatcher_UpdateConfigChangesResourceKey(t *testing.T) {
 
 	if got := rw.currentResourceKey(); got != "resource-new" {
 		t.Errorf("resource key = %v, want resource-new", got)
+	}
+}
+
+func TestResourceWatcher_NotFoundTriggersReconcile(t *testing.T) {
+	var transformCalls atomic.Int64
+	fetcher := &testFetcherWithStatusUpdater{}
+	fetcher.setDesiredState(nil) // removal must not depend on the comparison
+	fetcher.resourceErr = fmt.Errorf("describe instance: %w", ErrExternalResourceNotFound)
+	fetcher.transformFn = func(raw any) (any, error) {
+		transformCalls.Add(1)
+		return raw, nil
+	}
+
+	key := types.NamespacedName{Namespace: "default", Name: "removed"}
+	rw := newResourceWatcher(key, "rk", time.Hour, 0, fetcher, NewDeepEqualComparator(), logr.Discard(), nil)
+	q := newTestRequestQueue()
+	defer q.ShutDown()
+	rw.queue = q
+
+	rw.poll(context.Background())
+
+	req, ok := popRequest(q, time.Second)
+	if !ok {
+		t.Fatal("expected a reconcile request for the removed resource")
+	}
+	if req.NamespacedName != key {
+		t.Errorf("request key = %v, want %v", req.NamespacedName, key)
+	}
+	if got := fetcher.statusCalls.Load(); got != 0 {
+		t.Errorf("UpdateResourceStatus called %d times, want 0", got)
+	}
+	if got := transformCalls.Load(); got != 0 {
+		t.Errorf("TransformExternalState called %d times, want 0", got)
+	}
+
+	info, ok := rw.getLastDrift()
+	if !ok {
+		t.Fatal("expected LastDrift to be set")
+	}
+	if info.Reason != DriftReasonNotFound {
+		t.Errorf("Reason = %q, want %q", info.Reason, DriftReasonNotFound)
+	}
+	if info.Diff == "" {
+		t.Error("expected a non-empty Diff")
+	}
+}
+
+func TestResourceWatcher_NotFoundClearedWhenResourceReturns(t *testing.T) {
+	fetcher := &testFetcher{resourceErr: ErrExternalResourceNotFound}
+	fetcher.setDesiredState("state")
+	fetcher.setResourceState("state")
+
+	key := types.NamespacedName{Namespace: "default", Name: "recreated"}
+	rw := newResourceWatcher(key, "rk", time.Hour, 0, fetcher, NewDeepEqualComparator(), logr.Discard(), nil)
+
+	rw.poll(context.Background())
+	if _, ok := rw.getLastDrift(); !ok {
+		t.Fatal("expected LastDrift to be set while the resource is missing")
+	}
+
+	fetcher.mu.Lock()
+	fetcher.resourceErr = nil
+	fetcher.mu.Unlock()
+
+	rw.poll(context.Background())
+	if _, ok := rw.getLastDrift(); ok {
+		t.Error("expected LastDrift to clear once the resource is back")
+	}
+}
+
+func TestResourceWatcher_StateDriftReportsMismatchReason(t *testing.T) {
+	fetcher := &testFetcher{}
+	fetcher.setDesiredState("desired")
+	fetcher.setResourceState("actual")
+
+	key := types.NamespacedName{Namespace: "default", Name: "changed"}
+	rw := newResourceWatcher(key, "rk", time.Hour, 0, fetcher, NewDeepEqualComparator(), logr.Discard(), nil)
+
+	rw.poll(context.Background())
+
+	info, ok := rw.getLastDrift()
+	if !ok {
+		t.Fatal("expected LastDrift to be set")
+	}
+	if info.Reason != DriftReasonStateMismatch {
+		t.Errorf("Reason = %q, want %q", info.Reason, DriftReasonStateMismatch)
+	}
+}
+
+// compositeKey can't be compared with != because it holds a slice.
+type compositeKey struct {
+	IDs []string
+}
+
+func TestResourceWatcher_NotFoundWithStaleKeySwitchesKey(t *testing.T) {
+	fetcher := &testFetcher{resourceErr: ErrExternalResourceNotFound}
+	fetcher.setDesiredState("state")
+
+	key := types.NamespacedName{Namespace: "default", Name: "repointed"}
+	rw := newResourceWatcher(key, compositeKey{IDs: []string{"old"}}, time.Hour, 0,
+		fetcher, NewDeepEqualComparator(), logr.Discard(), nil)
+	rw.resolveKey = func(context.Context) (any, error) {
+		return compositeKey{IDs: []string{"new"}}, nil
+	}
+	q := newTestRequestQueue()
+	defer q.ShutDown()
+	rw.queue = q
+
+	rw.poll(context.Background())
+
+	if q.Len() != 0 {
+		t.Errorf("expected no reconcile for a stale key, queue len = %d", q.Len())
+	}
+	if _, ok := rw.getLastDrift(); ok {
+		t.Error("expected no LastDrift for a stale key")
+	}
+	got := rw.currentResourceKey().(compositeKey)
+	if len(got.IDs) != 1 || got.IDs[0] != "new" {
+		t.Errorf("resource key = %v, want the new key", got)
+	}
+}
+
+func TestResourceWatcher_NotFoundWithCurrentKeyReports(t *testing.T) {
+	fetcher := &testFetcher{resourceErr: ErrExternalResourceNotFound}
+	fetcher.setDesiredState("state")
+
+	key := types.NamespacedName{Namespace: "default", Name: "really-gone"}
+	rw := newResourceWatcher(key, compositeKey{IDs: []string{"id"}}, time.Hour, 0,
+		fetcher, NewDeepEqualComparator(), logr.Discard(), nil)
+	rw.resolveKey = func(context.Context) (any, error) {
+		return compositeKey{IDs: []string{"id"}}, nil
+	}
+	q := newTestRequestQueue()
+	defer q.ShutDown()
+	rw.queue = q
+
+	rw.poll(context.Background())
+
+	if _, ok := popRequest(q, time.Second); !ok {
+		t.Fatal("expected a reconcile request when the current key is missing")
+	}
+}
+
+func TestResourceWatcher_NotFoundUnconfirmedDoesNotReport(t *testing.T) {
+	fetcher := &testFetcher{resourceErr: ErrExternalResourceNotFound}
+	fetcher.setDesiredState("state")
+
+	key := types.NamespacedName{Namespace: "default", Name: "unconfirmed"}
+	rw := newResourceWatcher(key, "rk", time.Hour, 0, fetcher, NewDeepEqualComparator(), logr.Discard(), nil)
+	rw.resolveKey = func(context.Context) (any, error) {
+		return nil, errors.New("cache unavailable")
+	}
+	q := newTestRequestQueue()
+	defer q.ShutDown()
+	rw.queue = q
+
+	rw.poll(context.Background())
+
+	if q.Len() != 0 {
+		t.Errorf("expected no reconcile when the key can't be confirmed, queue len = %d", q.Len())
+	}
+	if _, ok := rw.getLastDrift(); ok {
+		t.Error("expected no LastDrift when the key can't be confirmed")
 	}
 }

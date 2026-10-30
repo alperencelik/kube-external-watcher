@@ -161,6 +161,32 @@ func TestMetrics_FetchExternalErrorIncrementsCounter(t *testing.T) {
 	}
 }
 
+func TestMetrics_NotFoundCountsAsDriftNotError(t *testing.T) {
+	m, reg := newTestMetrics(t)
+	fetcher := &testFetcher{resourceErr: ErrExternalResourceNotFound}
+	fetcher.setDesiredState("desired")
+	key := types.NamespacedName{Namespace: "default", Name: "test-not-found"}
+
+	rw := newResourceWatcher(key, "rk", 1*time.Hour, 0, fetcher, NewDeepEqualComparator(), logr.Discard(), m)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	rw.poll(ctx)
+
+	labels := map[string]string{"controller": "test-controller", "namespace": "default", "name": "test-not-found"}
+	if v := getCounterValue(t, reg, "kube_external_watcher_drift_detected_total", labels); v != 1 {
+		t.Errorf("expected drift_detected=1, got %v", v)
+	}
+	if v := getCounterValue(t, reg, "kube_external_watcher_fetch_external_errors_total", labels); v != 0 {
+		t.Errorf("expected fetch_external_errors=0, got %v", v)
+	}
+
+	pollLabels := map[string]string{"controller": "test-controller", "namespace": "default", "name": "test-not-found", "result": "not_found"}
+	if v := getCounterValue(t, reg, "kube_external_watcher_poll_total", pollLabels); v != 1 {
+		t.Errorf("expected poll_total{not_found}=1, got %v", v)
+	}
+}
+
 func TestMetrics_FetchDurationRecorded(t *testing.T) {
 	m, reg := newTestMetrics(t)
 	fetcher := &testFetcher{}

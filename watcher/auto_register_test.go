@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1059,5 +1060,92 @@ func TestAutoRegister_RetryUsesLatestObject(t *testing.T) {
 	}
 	if got := rw.currentResourceKey(); got != "new" {
 		t.Errorf("expected ResourceKey from latest object %q, got %v", "new", got)
+	}
+}
+
+// A filter can drop the update that carries a new external ID. The old ID
+// then reports not-found, which must not look like a removal.
+func TestAutoRegister_NotFoundOnStaleKeyFollowsLatestObject(t *testing.T) {
+	w, fi := setupTestWatcherWithFilter(t, func(obj client.Object) ResourceConfig {
+		return ResourceConfig{ResourceKey: obj.(*corev1.ConfigMap).Data["id"]}
+	}, EventFilter{
+		Update: func(_, _ client.Object) bool { return false },
+	})
+
+	var oldRemoved atomic.Bool
+	fetcher := w.fetcher.(*testFetcher)
+	fetcher.mu.Lock()
+	fetcher.fetchFn = func(objKey any) (any, error) {
+		if objKey == "old" && oldRemoved.Load() {
+			return nil, ErrExternalResourceNotFound
+		}
+		return "desired", nil
+	}
+	fetcher.mu.Unlock()
+
+	q := newTestRequestQueue()
+	defer q.ShutDown()
+	cancel := startTestWatcher(t, w, q)
+	defer cancel()
+
+	oldObj := newTestObj("repointed").(*corev1.ConfigMap)
+	oldObj.Data = map[string]string{"id": "old"}
+	newObj := oldObj.DeepCopy()
+	newObj.Data["id"] = "new"
+	key := types.NamespacedName{Namespace: "default", Name: "repointed"}
+
+	fi.handler.OnAdd(oldObj, false)
+	fi.handler.OnUpdate(oldObj, newObj)
+	oldRemoved.Store(true)
+
+	w.mu.RLock()
+	rw := w.watchers[key]
+	w.mu.RUnlock()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for rw.currentResourceKey() != "new" {
+		if time.Now().After(deadline) {
+			t.Fatalf("resource key = %v, want new", rw.currentResourceKey())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// Let a poll run against the new key, which exists.
+	time.Sleep(100 * time.Millisecond)
+	if q.Len() != 0 {
+		t.Errorf("expected no reconcile for a stale key, queue len = %d", q.Len())
+	}
+	if _, ok := w.LastDrift(key); ok {
+		t.Error("expected no drift to be recorded for a stale key")
+	}
+}
+
+// With a current key, not-found is a real removal.
+func TestAutoRegister_NotFoundOnCurrentKeyTriggersReconcile(t *testing.T) {
+	w, fi, q, fetcher := setupTestWatcher(t, func(obj client.Object) ResourceConfig {
+		return ResourceConfig{ResourceKey: "resource-" + obj.GetName()}
+	})
+
+	fetcher.mu.Lock()
+	fetcher.fetchFn = func(any) (any, error) {
+		return nil, ErrExternalResourceNotFound
+	}
+	fetcher.mu.Unlock()
+
+	cancel := startTestWatcher(t, w, q)
+	defer cancel()
+
+	key := types.NamespacedName{Namespace: "default", Name: "gone"}
+	fi.handler.OnAdd(newTestObj("gone"), false)
+
+	if req := waitForQueueRequest(t, q); req.NamespacedName != key {
+		t.Errorf("request key = %v, want %v", req.NamespacedName, key)
+	}
+	info, ok := w.LastDrift(key)
+	if !ok {
+		t.Fatal("expected LastDrift to be set")
+	}
+	if info.Reason != DriftReasonNotFound {
+		t.Errorf("Reason = %q, want %q", info.Reason, DriftReasonNotFound)
 	}
 }

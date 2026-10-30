@@ -2,6 +2,8 @@ package watcher
 
 import (
 	"context"
+	"errors"
+	"reflect"
 	"sync"
 	"time"
 
@@ -21,6 +23,11 @@ type resourceWatcher struct {
 	// resourceKey is the external resource ID. It can change while the
 	// watcher runs, so mu guards it.
 	resourceKey any
+
+	// resolveKey returns the current external resource ID from the CR.
+	// Set only for auto-registered resources, where the reconciler cannot
+	// correct the ID through Register. Nil otherwise.
+	resolveKey func(ctx context.Context) (any, error)
 
 	fetcher    ResourceStateFetcher
 	comparator StateComparator
@@ -97,6 +104,12 @@ func (rw *resourceWatcher) updateConfig(resourceKey any, pollInterval time.Durat
 	rw.pollInterval = pollInterval
 }
 
+func (rw *resourceWatcher) setResourceKey(resourceKey any) {
+	rw.mu.Lock()
+	defer rw.mu.Unlock()
+	rw.resourceKey = resourceKey
+}
+
 func (rw *resourceWatcher) currentResourceKey() any {
 	rw.mu.Lock()
 	defer rw.mu.Unlock()
@@ -167,10 +180,15 @@ func (rw *resourceWatcher) poll(ctx context.Context) {
 		return
 	}
 
+	polledKey := rw.currentResourceKey()
 	fetchStart := time.Now()
-	rawExternal, err := rw.fetcher.FetchExternalResource(ctx, rw.currentResourceKey())
+	rawExternal, err := rw.fetcher.FetchExternalResource(ctx, polledKey)
 	rw.metrics.observeFetchDuration(ns, name, time.Since(fetchStart))
 	if err != nil {
+		if errors.Is(err, ErrExternalResourceNotFound) {
+			rw.handleNotFound(ctx, polledKey)
+			return
+		}
 		rw.logger.Error(err, "failed to fetch external resource state")
 		rw.metrics.incFetchExternalErrors(ns, name)
 		rw.metrics.incPollTotal(ns, name, "error")
@@ -204,6 +222,7 @@ func (rw *resourceWatcher) poll(ctx context.Context) {
 		rw.setLastDrift(DriftInfo{
 			Key:        rw.key,
 			DetectedAt: time.Now(),
+			Reason:     DriftReasonStateMismatch,
 			Diff:       rw.comparator.Diff(desired, actual),
 		})
 
@@ -216,4 +235,43 @@ func (rw *resourceWatcher) poll(ctx context.Context) {
 	}
 
 	rw.metrics.incPollTotal(ns, name, "success")
+}
+
+// handleNotFound reports a removed external resource, unless polledKey is
+// out of date. The CR may point at a new ID that an EventFilter kept from
+// reaching us, and reporting that as a removal would repeat on every poll.
+func (rw *resourceWatcher) handleNotFound(ctx context.Context, polledKey any) {
+	ns, name := rw.key.Namespace, rw.key.Name
+
+	if rw.resolveKey != nil {
+		latest, err := rw.resolveKey(ctx)
+		if err != nil {
+			rw.logger.Error(err, "failed to confirm external resource ID")
+			rw.metrics.incPollTotal(ns, name, "error")
+			return
+		}
+		// DeepEqual because ResourceKey can be a struct that != panics on.
+		if !reflect.DeepEqual(latest, polledKey) {
+			rw.logger.V(1).Info("external resource ID changed, switching to it")
+			rw.setResourceKey(latest)
+			rw.metrics.incPollTotal(ns, name, "success")
+			return
+		}
+	}
+
+	rw.logger.V(1).Info("external resource not found, triggering reconciliation")
+	rw.metrics.incDriftDetected(ns, name)
+	rw.metrics.incPollTotal(ns, name, "not_found")
+
+	rw.setLastDrift(DriftInfo{
+		Key:        rw.key,
+		DetectedAt: time.Now(),
+		Reason:     DriftReasonNotFound,
+		Diff:       ErrExternalResourceNotFound.Error(),
+	})
+
+	if rw.queue != nil {
+		rw.queue.Add(reconcile.Request{NamespacedName: rw.key})
+		rw.logger.V(2).Info("reconcile request enqueued")
+	}
 }
